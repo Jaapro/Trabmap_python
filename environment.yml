@@ -1,0 +1,21 @@
+name: trabmap
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - scipy
+  - scikit-image
+  - tifffile
+  - simpleitk
+  - pyyaml
+  - matplotlib
+  - pyvista
+  - pip
+  - pip:
+      - nibabel
+      - tetgen
+      - pymeshfix
+      - pyacvd
+      - -e .

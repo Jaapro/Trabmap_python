@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.env
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Large generated TrabMap outputs
+input/
+output/
+*.tif
+*.tiff
+*.nii
+*.nii.gz
+*.vtk
+*.vtp
+*.npy
+
+# Keep the example runner CSV
+!data/trabmap_runner.csv

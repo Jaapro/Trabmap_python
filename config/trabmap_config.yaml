@@ -1,0 +1,77 @@
+# TrabMap configuration file
+# Edit these paths once, then run the command-line scripts without editing code.
+
+segmentation:
+  runner_csv: data/trabmap_runner.csv
+  input_root: input
+
+  object_column: object
+  segmented_column: segmented
+  voxel_size_column: voxel_size
+  input_folder_suffix: _TRABCORT
+
+  periosteal_threshold: 1
+  endosteal_threshold: 1
+  image_extensions: [.tif, .tiff, .png, .jpg, .jpeg]
+
+  min_bone_object_size: 1000
+  use_median_filter: true
+  median_size_voxels: [1, 3, 3]
+
+  crop_to_bone_bbox: true
+  bbox_padding_voxels: 10
+
+  cap_for_3d_fill: true
+  cap_thickness_slices: 5
+  surface_hole_close_radius_mm: 0.60 # default 0.60
+
+  keep_largest_internal_void_component: true
+  protected_bone_close_radius_mm: 0.05
+  marrow_close_radius_mm: 0.70 
+  internal_fill_mode: 3d
+  keep_largest_trabfill_component: true
+  remove_thin_trab_edge_lines: true
+  thin_trab_open_radius_voxels: 1
+  save_middle_slice_debugs: true
+
+mapping:
+  runner_csv: data/trabmap_runner.csv
+  input_root: input
+
+  landmarks_csv: null
+  use_custom_anatomical_frame: false
+
+  sphere_radius: 5.0
+  grid_step: 2.5
+  margin: null
+  center_inclusion_mode: skip_outside
+
+  use_structure_tensor: true
+  st_sigma: 1.0
+
+  use_crop: false
+  crop_z: [0, 300]
+  crop_y: [0, 300]
+  crop_x: [0, 350]
+
+  save_auto_filled_mask: true
+  save_point_vtp: true
+  save_dense_nifti: false
+  dense_map_mode: local_sphere
+  progress_every: 50
+
+  make_mesh: true
+  mesh_out: null
+  mesh_target: cells
+  mesh_method: idw
+  mesh_k: 4
+  mesh_power: 2.0
+  mesh_value_columns: null
+
+  mesh_pad_width: 20
+  mesh_largest_component: true
+  meshfix: true
+  pyacvd: true
+  pyacvd_n_surf: 7500
+  pyacvd_subdivide: 0
+  tetgen_switches: pq1.2Q
