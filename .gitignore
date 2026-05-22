@@ -8,7 +8,7 @@ build/
 dist/
 *.egg-info/
 
-# Large generated TrabMap outputs
+# Large generated Trabmap outputs
 input/
 output/
 *.tif
@@ -18,6 +18,10 @@ output/
 *.vtk
 *.vtp
 *.npy
+
+# keep the example dataset
+!input/AIM11444_pongo_pygmaeus_HUM_prox_resampled
+!input/AIM11444_pongo_pygmaeus_HUM_prox_resampled**
 
 # Keep the example runner CSV
 !data/trabmap_runner.csv
