@@ -99,10 +99,8 @@ python scripts/run_mapping.py --config config/trabmap_config.yaml
 ## What changed from the original scripts?
 
 - Hard-coded workstation paths were removed.
-- Parameters now live in `config/trabmap_config.yaml`.
+- Parameters are now stored and can be altered in `config/trabmap_config.yaml`.
 - The two working scripts were converted into importable modules.
-- Command-line entry points were added.
-- The existing runner CSV logic is preserved.
 
 ## Notes
 
