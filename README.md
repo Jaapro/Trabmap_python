@@ -1,4 +1,4 @@
-# TrabMap
+# Trabmap
 
 Trabmap is an open-source Python pipeline for semi-automated cortical/trabecular bone segmentation and whole-bone trabecular structure mapping.
 
