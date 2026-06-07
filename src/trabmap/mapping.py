@@ -526,6 +526,72 @@ def local_sphere_heatmap(shape: tuple, centers: list, values: list, sphere_radiu
     return out
 
 
+
+def add_bvtv_derived_columns(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Add BV/TV normalization columns to a results dataframe.
+
+    New columns
+    -----------
+    rBVTV
+        BVTV divided by the mean BVTV of all finite BVTV values in this object.
+    BVTV_zscore
+        (BVTV - mean BVTV) divided by the population standard deviation of BVTV
+        across all finite BVTV values in this object.
+    BVTV_minmax
+        BVTV rescaled from 0 to 1, where 0 is the minimum finite BVTV value and
+        1 is the maximum finite BVTV value for this object.
+
+    Degenerate cases are handled explicitly:
+    - If mean BVTV is 0 or undefined, rBVTV is NaN.
+    - If BVTV standard deviation is 0 or undefined, BVTV_zscore is set to 0 for
+      finite BVTV values because all finite values are identical.
+    - If BVTV min equals BVTV max, BVTV_minmax is set to 0 for finite BVTV values
+      because there is no range to scale.
+    """
+    if "BVTV" not in results_df.columns:
+        return results_df
+
+    out = results_df.copy()
+    bvtv = pd.to_numeric(out["BVTV"], errors="coerce")
+    finite = np.isfinite(bvtv.to_numpy(dtype=float))
+
+    if not np.any(finite):
+        out["rBVTV"] = np.nan
+        out["BVTV_zscore"] = np.nan
+        out["BVTV_minmax"] = np.nan
+        return out
+
+    vals = bvtv.to_numpy(dtype=float)[finite]
+    mean_bvtv = float(np.mean(vals))
+    std_bvtv = float(np.std(vals, ddof=0))
+    min_bvtv = float(np.min(vals))
+    max_bvtv = float(np.max(vals))
+
+    out["rBVTV"] = np.nan
+    if np.isfinite(mean_bvtv) and mean_bvtv != 0:
+        out.loc[finite, "rBVTV"] = vals / mean_bvtv
+
+    out["BVTV_zscore"] = np.nan
+    if np.isfinite(std_bvtv) and std_bvtv > 0:
+        out.loc[finite, "BVTV_zscore"] = (vals - mean_bvtv) / std_bvtv
+    else:
+        out.loc[finite, "BVTV_zscore"] = 0.0
+
+    out["BVTV_minmax"] = np.nan
+    value_range = max_bvtv - min_bvtv
+    if np.isfinite(value_range) and value_range > 0:
+        out.loc[finite, "BVTV_minmax"] = (vals - min_bvtv) / value_range
+    else:
+        out.loc[finite, "BVTV_minmax"] = 0.0
+
+    print(
+        "BVTV summary for derived columns: "
+        f"mean={mean_bvtv:.6g}, std={std_bvtv:.6g}, "
+        f"min={min_bvtv:.6g}, max={max_bvtv:.6g}"
+    )
+    return out
+
+
 def export_spheres_to_vtp(results_df: pd.DataFrame, out_path: str, use_only_inside=True):
     if pv is None:
         raise ImportError("pyvista is required to save VTP. Install with: pip install pyvista")
@@ -540,7 +606,7 @@ def export_spheres_to_vtp(results_df: pd.DataFrame, out_path: str, use_only_insi
     ]).T
     cloud = pv.PolyData(points)
 
-    for col in [c for c in ["BVTV", "TbTh_mean_local", "TbTh_p90_local", "TbTh_p95_local", "TbTh_max_local", "anisotropy_st", "angle_to_custom_long_axis_deg"] if c in df.columns]:
+    for col in [c for c in ["BVTV", "rBVTV", "BVTV_zscore", "BVTV_minmax", "TbTh_mean_local", "TbTh_p90_local", "TbTh_p95_local", "TbTh_max_local", "anisotropy_st", "angle_to_custom_long_axis_deg"] if c in df.columns]:
         cloud[col] = df[col].to_numpy()
 
     if all(c in df.columns for c in ["primary_dir_st_x", "primary_dir_st_y", "primary_dir_st_z"]):
@@ -738,6 +804,10 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     results_df = pd.DataFrame(results)
     print("Finished sphere analysis. Rows:", len(results_df))
 
+    # Add object-level BV/TV normalized variables before writing CSV/VTP/mesh outputs.
+    # These are calculated from the finite BVTV values saved for this object.
+    results_df = add_bvtv_derived_columns(results_df)
+
     csv_path = out_dir / prefixed_name(args, "trabecular_results.csv")
     results_df.to_csv(csv_path, index=False)
     print("Saved CSV:", csv_path)
@@ -772,7 +842,7 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
         paint_mask = results_df["inside_filled_mask"].to_numpy() == 1
         kept_centers_dense = [c for c, keep in zip(kept_centers, paint_mask) if keep]
         results_df_dense = results_df.loc[paint_mask].reset_index(drop=True)
-        for var in [v for v in ["BVTV", "TbTh_mean_local", "TbTh_p90_local", "TbTh_p95_local", "TbTh_max_local", "anisotropy_st", "angle_to_custom_long_axis_deg"] if v in results_df_dense.columns]:
+        for var in [v for v in ["BVTV", "rBVTV", "BVTV_zscore", "BVTV_minmax", "TbTh_mean_local", "TbTh_p90_local", "TbTh_p95_local", "TbTh_max_local", "anisotropy_st", "angle_to_custom_long_axis_deg"] if v in results_df_dense.columns]:
             if args.dense_map_mode == "local_sphere":
                 vol = local_sphere_heatmap(bone.shape, kept_centers_dense, results_df_dense[var].tolist(), args.sphere_radius, spacing)
             else:

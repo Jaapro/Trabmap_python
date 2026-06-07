@@ -72,6 +72,10 @@ THIN_TRAB_OPEN_RADIUS_VOXELS = 1
 
 SAVE_MIDDLE_SLICE_DEBUGS = True
 
+# Raw user-supplied config values are stored here by run_from_config() so they
+# can be written back to the runner CSV for reproducibility.
+CONFIG_VALUES = {}
+
 
 # ============================================================
 # BASIC HELPERS
@@ -621,6 +625,46 @@ def segment_bone(
     }
 
 
+
+# ============================================================
+# CONFIG LOGGING HELPERS
+# ============================================================
+
+def simple_config_value(value):
+    """Convert config values to runner-CSV friendly text."""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(x) for x in value)
+    return value
+
+
+def flatten_config_values(config, prefix=""):
+    """Flatten a config dictionary/list into key-value pairs for runner CSV logging."""
+    if not config:
+        return {}
+    flat = {}
+    if isinstance(config, dict):
+        for key, value in config.items():
+            safe_key = str(key).strip().replace(" ", "_").replace("-", "_")
+            new_prefix = f"{prefix}_{safe_key}" if prefix else safe_key
+            flat.update(flatten_config_values(value, new_prefix))
+    elif isinstance(config, (list, tuple)):
+        flat[prefix] = simple_config_value(config)
+    else:
+        flat[prefix] = simple_config_value(config)
+    return flat
+
+
+def write_config_values_to_runner_row(df, idx):
+    """Write every user-supplied segmentation config value to the runner CSV."""
+    if not CONFIG_VALUES:
+        return
+    for key, value in flatten_config_values(CONFIG_VALUES).items():
+        col = f"config_segmentation_{key}"
+        if col not in df.columns:
+            df[col] = ""
+        df.loc[idx, col] = simple_config_value(value)
+
+
 # ============================================================
 # MAIN BATCH LOOP
 # ============================================================
@@ -730,6 +774,7 @@ def main():
             )
 
         df.loc[idx, SEGMENTED_COLUMN] = "yes"
+        write_config_values_to_runner_row(df, idx)
 
         if check_runner_csv_writable(RUNNER_CSV):
             df.to_csv(RUNNER_CSV, index=False, sep=";")
@@ -760,6 +805,8 @@ def run_from_config(config):
     YAML names such as `runner_csv` or the original uppercase names such as
     `RUNNER_CSV`.
     """
+    global CONFIG_VALUES
+    CONFIG_VALUES = dict(config)
     from .config import apply_config_to_module
     apply_config_to_module(__import__(__name__, fromlist=['*']), config)
     return main()

@@ -1,5 +1,5 @@
 # TrabMap configuration file
-# Edit these paths once, then run the command-line scripts without editing code.
+# Edit mhese paths and variabeles, then run command line scripts
 
 segmentation:
   runner_csv: data/trabmap_runner.csv
@@ -26,12 +26,12 @@ segmentation:
   surface_hole_close_radius_mm: 0.60 # default 0.60
 
   keep_largest_internal_void_component: true
-  protected_bone_close_radius_mm: 0.05
+  protected_bone_close_radius_mm: 0.08 #default is 0.05
   marrow_close_radius_mm: 0.70 
   internal_fill_mode: 3d
   keep_largest_trabfill_component: true
   remove_thin_trab_edge_lines: true
-  thin_trab_open_radius_voxels: 1
+  thin_trab_open_radius_voxels: 2
   save_middle_slice_debugs: true
 
 mapping:
@@ -41,7 +41,7 @@ mapping:
   landmarks_csv: null
   use_custom_anatomical_frame: false
 
-  sphere_radius: 5.0
+  sphere_radius: 2.5
   grid_step: 2.5
   margin: null
   center_inclusion_mode: skip_outside
@@ -60,6 +60,26 @@ mapping:
   dense_map_mode: local_sphere
   progress_every: 50
 
+  # Optional smoothed/decimated surface mesh export for downstream analyses.
+  # Meshes are generated from the segmentation stacks listed in
+  # surface_mesh_suffixes, usually _FILL and _TRABFILL, and written to
+  # input/OBJECT_NAME/mappings/surface_meshes/.
+  make_surface_meshes: true
+  surface_mesh_suffixes: [_FILL, _TRABFILL]
+  surface_mesh_output_dir_name: surface_meshes
+  # VTP is kept for ParaView/PyVista workflows; STL is also written when
+  # surface_mesh_save_stl is true.
+  surface_mesh_file_format: vtp
+  surface_mesh_save_stl: true
+  surface_mesh_pad_width: 1
+  surface_mesh_keep_largest_component: true
+  surface_mesh_smooth_iterations: 30
+  surface_mesh_smooth_relaxation: 0.05
+  surface_mesh_decimate: true
+  surface_mesh_target_reduction: 0.90
+  surface_mesh_max_file_size_mb: 5.0
+  surface_mesh_fail_on_error: true
+
   make_mesh: true
   mesh_out: null
   mesh_target: cells
@@ -72,6 +92,6 @@ mapping:
   mesh_largest_component: true
   meshfix: true
   pyacvd: true
-  pyacvd_n_surf: 7500
+  pyacvd_n_surf: 10000 #reduce if it causes failure to mesh
   pyacvd_subdivide: 0
   tetgen_switches: pq1.2Q
