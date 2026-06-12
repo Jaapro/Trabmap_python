@@ -1,6 +1,6 @@
 """
-TrabMap local script: BV/TV, trabecular thickness, structure tensor direction,
-ParaView VTP export, and optional tetrahedral VTK mesh export.
+Trabmap local script: calculates BV/TV, trabecular thickness, structure tensor direction,
+ParaView VTP export, and optional tetrahedral VTK mesh export and surface meshes
 
 The script reads trabmap_runner.csv, finds rows where finished is not equal to "yes",
 auto-detects the matching _TRAB and _TRABFILL folders, runs Trabmap, prefixes
@@ -8,7 +8,7 @@ outputs with the object name, and writes the settings/status back to the runner 
 
 Notes:
 - Input and filled-mask can be a folder of .tif/.tiff slices, a 3D .tif/.tiff stack, or a .npy file.
-- Coordinates are assumed to be z,y,x in image arrays, and x,y,z in ParaView outputs.
+- Coordinates are assumed to be z,y,x in image arrays, and x,y,z in Paraview outputs.
 - Voxel spacing is assumed to be in mm
 """
 
@@ -42,7 +42,7 @@ except Exception:
 
 
 # =============================================================================
-# SETTINGS: EDIT THIS SECTION FOR YOUR WORKSTATION
+# SETTINGS: EDIT THESE IN THE CONFIG FILE
 # =============================================================================
 
 SETTINGS = SimpleNamespace(
@@ -53,7 +53,7 @@ SETTINGS = SimpleNamespace(
     # The uploaded example uses semicolons, which this script detects automatically.
     runner_csv="trabmap_runner.csv",
 
-    # Folder containing a subfolder per object that ends with _TRABMAP 
+    # Folder containing a subfolder per object.
     input_root="input",
 
     # Output parent folder. Each object gets its own subfolder here. old code
@@ -62,10 +62,9 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # Optional anatomical landmarks
     # -------------------------------------------------------------------------
-    # Keep as None unless every object should use the same landmarks CSV.
-    # If you need object-specific landmarks later, we can add a landmarks_csv
-    # column to the runner file.
-    # no longer used, to remove
+    # no longer used, to remove.
+    # instead use the runner file to give two sets of x,y,z coordinates of long 
+    # axis and one set for the rotational axis
     landmarks_csv=None,
 
     # -------------------------------------------------------------------------
@@ -79,9 +78,9 @@ SETTINGS = SimpleNamespace(
     # The two long-axis landmarks define anatomical axis 1.
     # this can be used to determine the orientation of the trabecular structure
     # relative to a specified long axis defined by two points and a rotation axis
-    # defined bz another point
-    # example: long axis can define proximodistal axis while the rotation axis
-    # is sued to specify where anterior is
+    # defined byy another point
+    # example: long axis can define the superior/inferior axis while the 
+    # rotation axis can be used to specify the anterior/posteior axis
     # The rotate landmark defines the orientation of axes 2 and 3 around that
     # long axis. If all nine values are present, primary_dir_st_anat_1/2/3 are
     # calculated in this custom frame, and angle_to_custom_long_axis_deg is also
@@ -97,21 +96,82 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # Spacing is read from the voxel_size column of the runner CSV and copied to
     # spacing_z, spacing_y, and spacing_x for each object.
-    sphere_radius=5.0, # default is 5.0
+    sphere_radius=2.5, # default is 2.5
     grid_step=2.5, # default is 2.5
     margin=None,
 
     # What to do with grid centers outside the filled mask:
     # "skip_outside" = ignore them; "zero_outside" = keep them with zero values.
     # skip outside is a sensible default, zero outside is to make output
-    # comparable to ORS Dragonfly
+    # comparable to ORS Dragonfly (but is not advised!)
     center_inclusion_mode="skip_outside",
+
+    # -------------------------------------------------------------------------
+    # Boundary handling for non-BV/TV measurements
+    # -------------------------------------------------------------------------
+    # BV/TV already uses only TRABFILL voxels in the denominator. These settings
+    # apply similar TRABFILL clipping to trabecular thickness and structure-tensor
+    # anisotropy so that voxels outside the anatomical trabecular compartment do
+    # not contribute to these local measurements.
+    clip_non_bvtv_to_filled_mask=True,
+    ignore_trabfill_boundary_for_thickness=True,
+    save_boundary_diagnostics=True,
+
+    # -------------------------------------------------------------------------
+    # Trabecular spacing settings
+    # -------------------------------------------------------------------------
+    # EDTSpacing is calculated as 2 * EDT(marrow space inside TRABFILL), analogous
+    # to the local trabecular thickness calculation. When
+    # ignore_trabfill_boundary_for_spacing=True, voxels outside TRABFILL do not
+    # act as biologically meaningful background, reducing boundary bias near
+    # the edge of the trabecular compartment.
+    calculate_trabecular_spacing=True,
+    ignore_trabfill_boundary_for_spacing=True,
 
     # -------------------------------------------------------------------------
     # Structure tensor settings
     # -------------------------------------------------------------------------
+    # st_sigma controls the amount of Gaussian smoothing applied before 
+    # calculating the structure tensor anisotropy (DA_ST). The value is 
+    # specified in voxels and determines the spatial scale over which 
+    # trabecular orientation is estimated. Increasing st_sigma causes 
+    # anisotropy to reflect larger-scale architectural trends and reduces noise
+    # sensitivity, but may blur fine local variation. Decreasing st_sigma 
+    # increases spatial resolution and sensitivity to local features, but may 
+    # produce noisier anisotropy estimates. A value of 1.0 voxel generally 
+    # provides a good balance between robustness and spatial detail.
     use_structure_tensor=True,
     st_sigma=1.0,
+
+    # -------------------------------------------------------------------------
+    # Optional Mean Intercept Length (MIL) anisotropy settings
+    # -------------------------------------------------------------------------
+    # This is slower than the structure-tensor method, especially for small
+    # grid steps and many specimens. It adds separate MIL columns and does not
+    # replace the existing structure-tensor outputs.
+    use_mil_anisotropy=False,
+
+    # MIL mode. "standard" is the original Trabmap implementation.
+    # "medtool" uses settings and fabric fitting chosen to mimic Medtool's
+    # default MIL fabric analysis as closely as possible.
+    mil_method="medtool",       # "standard" or "medtool"
+
+    # Standard Trabmap MIL settings.
+    mil_n_directions=91,
+    mil_line_spacing=None,       # None = one voxel width in mm, unless mil_length_units="voxels"
+    mil_sample_step=None,        # None = half a voxel width in mm, unless mil_length_units="voxels"
+    mil_min_intersections=2,
+    mil_da_mode="bounded",       # "bounded" = 1 - lambda_min/lambda_max; "ratio" = lambda_max/lambda_min
+
+    # Medtool-like MIL settings. Medtool's -morp defaults are:
+    # step=5 voxels, power=2 -> 8*4^2 = 128 directions, validLength=0.
+    # Medtool's -faba default is ellipsoid, -fabm default is MIL, and -fabn
+    # default is determinant normalization.
+    mil_power=None,              # if set, overrides mil_n_directions using 8*4^power
+    mil_length_units="mm",       # "mm" or "voxels" for mil_line_spacing/sample_step/valid_length
+    mil_valid_length=0.0,        # minimum valid bone intercept/chord length
+    mil_fabric_shape="ellipsoid",# "ellipsoid" or "tensor2"
+    mil_norm_type="det",         # "det", "trace", or "none"
 
     # -------------------------------------------------------------------------
     # Optional crop settings
@@ -133,6 +193,31 @@ SETTINGS = SimpleNamespace(
     progress_every=50,
 
     # -------------------------------------------------------------------------
+    # Optional decimated surface mesh export
+    # -------------------------------------------------------------------------
+    # These surface meshes are intended for downstream analyses and visualization.
+    # They are generated from the outer filled-bone stack (_FILL) and the internal
+    # trabecular compartment stack (_TRABFILL), then smoothed and decimated to
+    # keep file sizes manageable.
+    make_surface_meshes=True,
+    surface_mesh_suffixes=["_FILL", "_TRABFILL"],
+    surface_mesh_output_dir_name="surface_meshes",
+    # Primary surface mesh format. VTP is recommended because it preserves
+    # Pyvista/Paraview-friendly mesh metadata, and thez are useful for 
+    # visualization in paraview If surface_mesh_save_stl=True,
+    # a companion STL geometry file is also written for each surface.
+    surface_mesh_file_format="vtp",
+    surface_mesh_save_stl=True,
+    surface_mesh_pad_width=1,
+    surface_mesh_keep_largest_component=True,
+    surface_mesh_smooth_iterations=30,
+    surface_mesh_smooth_relaxation=0.05,
+    surface_mesh_decimate=True,
+    surface_mesh_target_reduction=0.90,
+    surface_mesh_max_file_size_mb=5.0,
+    surface_mesh_fail_on_error=True,
+
+    # -------------------------------------------------------------------------
     # Optional tetrahedral mesh export
     # -------------------------------------------------------------------------
     make_mesh=True,
@@ -148,7 +233,7 @@ SETTINGS = SimpleNamespace(
     mesh_power=2.0,
 
     # Comma-separated string of columns to map, or None for all numeric non-coordinate columns.
-    # Example: "BVTV,TbTh_mean_local,anisotropy_st"
+    # Example: "BVTV,EDTThickness_mean,DA_ST"
     mesh_value_columns=None,
 
     mesh_pad_width=20,
@@ -172,6 +257,26 @@ def validate_settings(args):
         raise ValueError('mesh_target must be "cells" or "points".')
     if args.mesh_method not in ["idw", "nearest"]:
         raise ValueError('mesh_method must be "idw" or "nearest".')
+    if getattr(args, "mil_method", "standard") not in ["standard", "medtool"]:
+        raise ValueError('mil_method must be "standard" or "medtool".')
+    if getattr(args, "mil_da_mode", "bounded") not in ["bounded", "ratio"]:
+        raise ValueError('mil_da_mode must be "bounded" or "ratio".')
+    if getattr(args, "mil_length_units", "mm") not in ["mm", "voxels"]:
+        raise ValueError('mil_length_units must be "mm" or "voxels".')
+    if getattr(args, "mil_fabric_shape", "ellipsoid") not in ["ellipsoid", "tensor2"]:
+        raise ValueError('mil_fabric_shape must be "ellipsoid" or "tensor2".')
+    if getattr(args, "mil_norm_type", "det") not in ["det", "trace", "none"]:
+        raise ValueError('mil_norm_type must be "det", "trace", or "none".')
+    if int(getattr(args, "mil_n_directions", 31)) < 6:
+        raise ValueError("mil_n_directions must be at least 6.")
+    if getattr(args, "mil_power", None) not in [None, "", "None"]:
+        if int(getattr(args, "mil_power")) < 0:
+            raise ValueError("mil_power must be >= 0.")
+    if getattr(args, "surface_mesh_file_format", "vtp") not in ["vtp", "ply", "stl"]:
+        raise ValueError('surface_mesh_file_format must be "vtp", "ply", or "stl".')
+    red = float(getattr(args, "surface_mesh_target_reduction", 0.90))
+    if not (0.0 <= red < 1.0):
+        raise ValueError("surface_mesh_target_reduction must be between 0.0 and 1.0.")
 
 
 def prefixed_name(args, filename: str) -> str:
@@ -400,6 +505,404 @@ def angle_to_axis_degrees(v_image: np.ndarray, axis_image: Optional[np.ndarray])
     cosang = float(np.clip(abs(np.dot(v, a)), -1.0, 1.0))
     return float(np.degrees(np.arccos(cosang)))
 
+def fibonacci_hemisphere_directions(n: int) -> np.ndarray:
+    """Return approximately uniform undirected test directions on one hemisphere.
+
+    MIL is axial, so d and -d are equivalent. Directions are returned in image
+    z,y,x order and normalized to unit length.
+    """
+    n = int(n)
+    if n < 1:
+        return np.empty((0, 3), dtype=float)
+    dirs = []
+    golden = np.pi * (3.0 - np.sqrt(5.0))
+    # Generate more full-sphere candidates, then fold into one hemisphere and
+    # remove near-duplicates by sign convention.
+    for i in range(max(2 * n, 12)):
+        z = 1.0 - 2.0 * (i + 0.5) / max(2 * n, 12)
+        r = np.sqrt(max(0.0, 1.0 - z * z))
+        theta = golden * i
+        v = np.array([z, r * np.sin(theta), r * np.cos(theta)], dtype=float)
+        v = enforce_sign_convention(v)
+        v = unit_vector(v)
+        if v is not None:
+            dirs.append(v)
+    unique = []
+    for v in dirs:
+        if all(abs(float(np.dot(v, u))) < 0.999 for u in unique):
+            unique.append(v)
+        if len(unique) >= n:
+            break
+    return np.asarray(unique, dtype=float)
+
+
+def perpendicular_basis(direction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return two unit vectors perpendicular to direction."""
+    d = unit_vector(direction)
+    if d is None:
+        raise ValueError("Cannot create perpendicular basis for zero vector.")
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(float(np.dot(d, ref))) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = unit_vector(np.cross(d, ref))
+    if u is None:
+        ref = np.array([0.0, 0.0, 1.0])
+        u = unit_vector(np.cross(d, ref))
+    v = unit_vector(np.cross(d, u))
+    return u, v
+
+
+def mil_for_direction_in_sphere(
+    bone: np.ndarray,
+    center: tuple,
+    radius_phys: float,
+    spacing: tuple,
+    direction: np.ndarray,
+    line_spacing: float,
+    sample_step: float,
+    min_intersections: int = 2,
+) -> tuple[float, int, float]:
+    """Original TrabMap MIL estimate for one direction within a spherical ROI.
+
+    This legacy mode counts binary transitions along parallel test lines and
+    returns total sampled test-line length divided by the number of transitions.
+    It is kept for backwards compatibility. For Medtool-like behavior, use
+    ``mil_for_direction_in_sphere_medtool``.
+    """
+    d = unit_vector(np.asarray(direction, dtype=float))
+    if d is None:
+        return np.nan, 0, 0.0
+    u, v = perpendicular_basis(d)
+
+    center_phys = np.array(
+        [center[0] * spacing[0], center[1] * spacing[1], center[2] * spacing[2]],
+        dtype=float,
+    )
+    offsets = np.arange(-radius_phys, radius_phys + 1e-9, line_spacing, dtype=float)
+    t_vals = np.arange(-radius_phys, radius_phys + 1e-9, sample_step, dtype=float)
+
+    total_length = 0.0
+    total_intersections = 0
+
+    for a in offsets:
+        for b in offsets:
+            offset2 = a * a + b * b
+            if offset2 > radius_phys * radius_phys:
+                continue
+            half_len = float(np.sqrt(max(radius_phys * radius_phys - offset2, 0.0)))
+            use_t = t_vals[(t_vals >= -half_len) & (t_vals <= half_len)]
+            if use_t.size < 2:
+                continue
+
+            pts_phys = center_phys + a * u + b * v + use_t[:, None] * d
+            coords = np.column_stack(
+                [
+                    np.rint(pts_phys[:, 0] / spacing[0]).astype(int),
+                    np.rint(pts_phys[:, 1] / spacing[1]).astype(int),
+                    np.rint(pts_phys[:, 2] / spacing[2]).astype(int),
+                ]
+            )
+            valid = (
+                (coords[:, 0] >= 0) & (coords[:, 0] < bone.shape[0]) &
+                (coords[:, 1] >= 0) & (coords[:, 1] < bone.shape[1]) &
+                (coords[:, 2] >= 0) & (coords[:, 2] < bone.shape[2])
+            )
+            if np.count_nonzero(valid) < 2:
+                continue
+            vals = np.zeros(coords.shape[0], dtype=np.uint8)
+            cvalid = coords[valid]
+            vals[valid] = bone[cvalid[:, 0], cvalid[:, 1], cvalid[:, 2]] > 0
+            transitions = int(np.count_nonzero(vals[1:] != vals[:-1]))
+            if transitions > 0:
+                total_intersections += transitions
+            total_length += float((use_t.size - 1) * sample_step)
+
+    if total_intersections < int(min_intersections) or total_length <= 0:
+        return np.nan, total_intersections, total_length
+    return float(total_length / total_intersections), total_intersections, total_length
+
+
+def _binary_run_lengths(vals: np.ndarray, sample_step: float) -> list[float]:
+    """Return physical lengths of contiguous True/bone runs along one sampled line."""
+    vals = np.asarray(vals, dtype=bool)
+    lengths = []
+    i = 0
+    n = len(vals)
+    while i < n:
+        if not vals[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and vals[j]:
+            j += 1
+        # If a run contains k sampled points, its chord length is approximated as
+        # k * sample_step. This is intentionally simple and Medtool-like because
+        # Medtool's morphological algorithm operates on sampled rays in voxel units.
+        lengths.append(float((j - i) * sample_step))
+        i = j
+    return lengths
+
+
+def mil_for_direction_in_sphere_medtool(
+    bone: np.ndarray,
+    center: tuple,
+    radius_phys: float,
+    spacing: tuple,
+    direction: np.ndarray,
+    line_spacing: float,
+    sample_step: float,
+    valid_length: float = 0.0,
+) -> tuple[float, int, float]:
+    """Medtool-like MIL for one direction within a spherical ROI.
+
+    Medtool's morphology options define a ray-field spacing (``step``), number
+    of directions, and minimum valid intercept length (``validLength``). This
+    function therefore estimates MIL as the mean length of valid bone chords
+    intercepted by a parallel ray field. Chords shorter than ``valid_length`` are
+    ignored. ``valid_length=0`` reproduces Medtool's permissive default.
+
+    This is not going to be identical to Medtool because the exact
+    proprietary ray generation and ellipsoid fitting details are not available,
+    but it is much closer than the previous implementation.
+    """
+    d = unit_vector(np.asarray(direction, dtype=float))
+    if d is None:
+        return np.nan, 0, 0.0
+    u, v = perpendicular_basis(d)
+
+    center_phys = np.array(
+        [center[0] * spacing[0], center[1] * spacing[1], center[2] * spacing[2]],
+        dtype=float,
+    )
+    offsets = np.arange(-radius_phys, radius_phys + 1e-9, line_spacing, dtype=float)
+    t_vals = np.arange(-radius_phys, radius_phys + 1e-9, sample_step, dtype=float)
+
+    valid_chord_lengths = []
+    total_sampled_length = 0.0
+
+    for a in offsets:
+        for b in offsets:
+            offset2 = a * a + b * b
+            if offset2 > radius_phys * radius_phys:
+                continue
+            half_len = float(np.sqrt(max(radius_phys * radius_phys - offset2, 0.0)))
+            use_t = t_vals[(t_vals >= -half_len) & (t_vals <= half_len)]
+            if use_t.size < 2:
+                continue
+
+            pts_phys = center_phys + a * u + b * v + use_t[:, None] * d
+            coords = np.column_stack(
+                [
+                    np.rint(pts_phys[:, 0] / spacing[0]).astype(int),
+                    np.rint(pts_phys[:, 1] / spacing[1]).astype(int),
+                    np.rint(pts_phys[:, 2] / spacing[2]).astype(int),
+                ]
+            )
+            valid = (
+                (coords[:, 0] >= 0) & (coords[:, 0] < bone.shape[0]) &
+                (coords[:, 1] >= 0) & (coords[:, 1] < bone.shape[1]) &
+                (coords[:, 2] >= 0) & (coords[:, 2] < bone.shape[2])
+            )
+            if np.count_nonzero(valid) < 2:
+                continue
+
+            vals = np.zeros(coords.shape[0], dtype=np.uint8)
+            cvalid = coords[valid]
+            vals[valid] = bone[cvalid[:, 0], cvalid[:, 1], cvalid[:, 2]] > 0
+
+            for length in _binary_run_lengths(vals, sample_step):
+                if length >= float(valid_length):
+                    valid_chord_lengths.append(float(length))
+
+            total_sampled_length += float((use_t.size - 1) * sample_step)
+
+    n_chords = len(valid_chord_lengths)
+    if n_chords == 0:
+        return np.nan, 0, total_sampled_length
+    return float(np.mean(valid_chord_lengths)), n_chords, total_sampled_length
+
+
+def _normalize_fabric_eigenvalues(eig: np.ndarray, norm_type: str) -> np.ndarray:
+    """Normalize fabric eigenvalues in a Medtool-like way."""
+    eig = np.asarray(eig, dtype=float).copy()
+    if np.any(~np.isfinite(eig)) or np.any(eig <= 0):
+        return eig
+    norm_type = str(norm_type).lower()
+    if norm_type == "trace":
+        s = float(np.sum(eig))
+        return eig * (3.0 / s) if s > 0 else eig
+    if norm_type == "det":
+        det = float(np.prod(eig))
+        return eig / (det ** (1.0 / 3.0)) if det > 0 else eig
+    return eig
+
+
+def _ellipsoid_fabric_from_mil(directions: np.ndarray, mils: np.ndarray, norm_type: str) -> tuple[np.ndarray, np.ndarray]:
+    """Fit an ellipsoid to directional MIL values.
+
+    We fit the quadratic form d.T A d = 1 / MIL(d)^2. The ellipsoid radii are
+    then 1/sqrt(eigenvalues(A)). These radii are used as fabric eigenvalues,
+    sorted from smallest to largest. The eigenvector associated with the largest
+    radius is the principal MIL direction.
+    """
+    D = np.asarray(directions, dtype=float)
+    M = np.asarray(mils, dtype=float)
+    ok = np.isfinite(M) & (M > 0)
+    D = D[ok]
+    M = M[ok]
+    if len(M) < 6:
+        return np.array([np.nan, np.nan, np.nan], dtype=float), np.full((3, 3), np.nan, dtype=float)
+
+    x, y, z = D[:, 0], D[:, 1], D[:, 2]
+    X = np.column_stack([x*x, y*y, z*z, 2*x*y, 2*x*z, 2*y*z])
+    b = 1.0 / (M * M)
+
+    try:
+        coeff, *_ = np.linalg.lstsq(X, b, rcond=None)
+        A = np.array(
+            [
+                [coeff[0], coeff[3], coeff[4]],
+                [coeff[3], coeff[1], coeff[5]],
+                [coeff[4], coeff[5], coeff[2]],
+            ],
+            dtype=float,
+        )
+        eig_a, vecs_a = np.linalg.eigh(A)
+        if np.any(~np.isfinite(eig_a)) or np.any(eig_a <= 0):
+            raise ValueError("Non-positive ellipsoid eigenvalue")
+        radii = 1.0 / np.sqrt(eig_a)
+        order = np.argsort(radii)
+        radii = radii[order]
+        vecs = vecs_a[:, order]
+        radii = _normalize_fabric_eigenvalues(radii, norm_type=norm_type)
+        return radii, vecs
+    except Exception:
+        return np.array([np.nan, np.nan, np.nan], dtype=float), np.full((3, 3), np.nan, dtype=float)
+
+
+def _tensor2_fabric_from_mil(directions: np.ndarray, mils: np.ndarray, norm_type: str) -> tuple[np.ndarray, np.ndarray]:
+    """Second-order tensor approximation from directional MIL values."""
+    D = np.asarray(directions, dtype=float)
+    M = np.asarray(mils, dtype=float)
+    ok = np.isfinite(M) & (M > 0)
+    D = D[ok]
+    M = M[ok]
+    if len(M) < 6:
+        return np.array([np.nan, np.nan, np.nan], dtype=float), np.full((3, 3), np.nan, dtype=float)
+
+    weights = M ** 2
+    fabric = np.zeros((3, 3), dtype=float)
+    for w, d in zip(weights, D):
+        fabric += w * np.outer(d, d)
+    fabric /= float(np.sum(weights))
+    eig, vecs = np.linalg.eigh(fabric)
+    order = np.argsort(eig)
+    eig = eig[order]
+    vecs = vecs[:, order]
+    eig = _normalize_fabric_eigenvalues(eig, norm_type=norm_type)
+    return eig, vecs
+
+
+def local_mil_fabric(
+    bone: np.ndarray,
+    center: tuple,
+    radius_phys: float,
+    spacing: tuple,
+    directions: np.ndarray,
+    line_spacing: float,
+    sample_step: float,
+    min_intersections: int = 2,
+    da_mode: str = "bounded",
+    method: str = "standard",
+    valid_length: float = 0.0,
+    fabric_shape: str = "ellipsoid",
+    norm_type: str = "det",
+) -> dict[str, object]:
+    """Estimate local MIL fabric tensor and anisotropy for one spherical ROI.
+
+    method="standard" keeps the older Trabmap transition-count approach.
+    method="medtool" uses a chord-length ray-field approach with ellipsoid
+    fitting and determinant normalization, matching Medtool defaults as closely
+    as possible from public option descriptions. Still not exactly the same as 
+    medtool due to missing information on the exact algorithm
+    """
+    mils = []
+    valid_dirs = []
+    total_intersections = 0
+    total_line_length = 0.0
+    method = str(method).lower()
+
+    for d in directions:
+        if method == "medtool":
+            mil, nint, llen = mil_for_direction_in_sphere_medtool(
+                bone=bone,
+                center=center,
+                radius_phys=radius_phys,
+                spacing=spacing,
+                direction=d,
+                line_spacing=line_spacing,
+                sample_step=sample_step,
+                valid_length=valid_length,
+            )
+        else:
+            mil, nint, llen = mil_for_direction_in_sphere(
+                bone=bone,
+                center=center,
+                radius_phys=radius_phys,
+                spacing=spacing,
+                direction=d,
+                line_spacing=line_spacing,
+                sample_step=sample_step,
+                min_intersections=min_intersections,
+            )
+        if np.isfinite(mil) and mil > 0:
+            mils.append(float(mil))
+            valid_dirs.append(np.asarray(d, dtype=float))
+        total_intersections += int(nint)
+        total_line_length += float(llen)
+
+    if len(mils) < 6:
+        return {
+            "eig": np.array([np.nan, np.nan, np.nan], dtype=float),
+            "dir": np.array([np.nan, np.nan, np.nan], dtype=float),
+            "anisotropy": np.nan,
+            "valid_directions": len(mils),
+            "mean_mil": np.nan,
+            "total_intersections": total_intersections,
+            "total_line_length": total_line_length,
+        }
+
+    mils = np.asarray(mils, dtype=float)
+    valid_dirs = np.asarray(valid_dirs, dtype=float)
+
+    if method == "medtool" and str(fabric_shape).lower() == "ellipsoid":
+        eig, vecs = _ellipsoid_fabric_from_mil(valid_dirs, mils, norm_type=norm_type)
+    else:
+        eig, vecs = _tensor2_fabric_from_mil(valid_dirs, mils, norm_type=norm_type)
+
+    if np.any(~np.isfinite(eig)) or vecs.shape != (3, 3):
+        principal = np.array([np.nan, np.nan, np.nan], dtype=float)
+        anisotropy = np.nan
+    else:
+        principal = enforce_sign_convention(vecs[:, -1])
+        if eig[-1] > 0 and eig[0] > 0:
+            if da_mode == "ratio":
+                anisotropy = float(eig[-1] / eig[0])
+            else:
+                anisotropy = float(1.0 - eig[0] / eig[-1])
+        else:
+            anisotropy = np.nan
+
+    return {
+        "eig": eig,
+        "dir": principal,
+        "anisotropy": anisotropy,
+        "valid_directions": len(mils),
+        "mean_mil": float(np.mean(mils)),
+        "total_intersections": total_intersections,
+        "total_line_length": total_line_length,
+    }
+
 
 # =============================================================================
 # Sphere analysis
@@ -526,72 +1029,6 @@ def local_sphere_heatmap(shape: tuple, centers: list, values: list, sphere_radiu
     return out
 
 
-
-def add_bvtv_derived_columns(results_df: pd.DataFrame) -> pd.DataFrame:
-    """Add BV/TV normalization columns to a results dataframe.
-
-    New columns
-    -----------
-    rBVTV
-        BVTV divided by the mean BVTV of all finite BVTV values in this object.
-    BVTV_zscore
-        (BVTV - mean BVTV) divided by the population standard deviation of BVTV
-        across all finite BVTV values in this object.
-    BVTV_minmax
-        BVTV rescaled from 0 to 1, where 0 is the minimum finite BVTV value and
-        1 is the maximum finite BVTV value for this object.
-
-    Degenerate cases are handled explicitly:
-    - If mean BVTV is 0 or undefined, rBVTV is NaN.
-    - If BVTV standard deviation is 0 or undefined, BVTV_zscore is set to 0 for
-      finite BVTV values because all finite values are identical.
-    - If BVTV min equals BVTV max, BVTV_minmax is set to 0 for finite BVTV values
-      because there is no range to scale.
-    """
-    if "BVTV" not in results_df.columns:
-        return results_df
-
-    out = results_df.copy()
-    bvtv = pd.to_numeric(out["BVTV"], errors="coerce")
-    finite = np.isfinite(bvtv.to_numpy(dtype=float))
-
-    if not np.any(finite):
-        out["rBVTV"] = np.nan
-        out["BVTV_zscore"] = np.nan
-        out["BVTV_minmax"] = np.nan
-        return out
-
-    vals = bvtv.to_numpy(dtype=float)[finite]
-    mean_bvtv = float(np.mean(vals))
-    std_bvtv = float(np.std(vals, ddof=0))
-    min_bvtv = float(np.min(vals))
-    max_bvtv = float(np.max(vals))
-
-    out["rBVTV"] = np.nan
-    if np.isfinite(mean_bvtv) and mean_bvtv != 0:
-        out.loc[finite, "rBVTV"] = vals / mean_bvtv
-
-    out["BVTV_zscore"] = np.nan
-    if np.isfinite(std_bvtv) and std_bvtv > 0:
-        out.loc[finite, "BVTV_zscore"] = (vals - mean_bvtv) / std_bvtv
-    else:
-        out.loc[finite, "BVTV_zscore"] = 0.0
-
-    out["BVTV_minmax"] = np.nan
-    value_range = max_bvtv - min_bvtv
-    if np.isfinite(value_range) and value_range > 0:
-        out.loc[finite, "BVTV_minmax"] = (vals - min_bvtv) / value_range
-    else:
-        out.loc[finite, "BVTV_minmax"] = 0.0
-
-    print(
-        "BVTV summary for derived columns: "
-        f"mean={mean_bvtv:.6g}, std={std_bvtv:.6g}, "
-        f"min={min_bvtv:.6g}, max={max_bvtv:.6g}"
-    )
-    return out
-
-
 def export_spheres_to_vtp(results_df: pd.DataFrame, out_path: str, use_only_inside=True):
     if pv is None:
         raise ImportError("pyvista is required to save VTP. Install with: pip install pyvista")
@@ -606,7 +1043,19 @@ def export_spheres_to_vtp(results_df: pd.DataFrame, out_path: str, use_only_insi
     ]).T
     cloud = pv.PolyData(points)
 
-    for col in [c for c in ["BVTV", "rBVTV", "BVTV_zscore", "BVTV_minmax", "TbTh_mean_local", "TbTh_p90_local", "TbTh_p95_local", "TbTh_max_local", "anisotropy_st", "angle_to_custom_long_axis_deg"] if c in df.columns]:
+    scalar_cols = [
+        "BVTV", "rBVTV", "BVTV_zscore", "BVTV_minmax",
+        "valid_trabfill_voxels_in_sphere", "total_voxels_in_sphere",
+        "valid_fraction_trabfill", "distance_to_trabfill_boundary_mm",
+        "distance_to_trabfill_boundary_vox",
+        "EDTThickness_mean", "EDTThickness_max",
+        "EDTSpacing_mean", "EDTSpacing_max",
+        "DA_ST", "angle_to_custom_long_axis_deg",
+        "DA_MIL", "mean_intercept_length_mil", "mil_valid_directions",
+        "mil_total_intersections", "mil_total_line_length",
+        "angle_mil_to_custom_long_axis_deg",
+    ]
+    for col in [c for c in scalar_cols if c in df.columns]:
         cloud[col] = df[col].to_numpy()
 
     if all(c in df.columns for c in ["primary_dir_st_x", "primary_dir_st_y", "primary_dir_st_z"]):
@@ -625,8 +1074,28 @@ def export_spheres_to_vtp(results_df: pd.DataFrame, out_path: str, use_only_insi
         ]).T
         cloud["principal_direction_anatomical"] = veca
 
-    if "anisotropy_st" in df.columns and "principal_direction" in cloud.array_names:
-        cloud["dir_weighted"] = cloud["principal_direction"] * df["anisotropy_st"].to_numpy()[:, None]
+
+    if all(c in df.columns for c in ["primary_dir_mil_x", "primary_dir_mil_y", "primary_dir_mil_z"]):
+        vec_mil = np.vstack([
+            df["primary_dir_mil_x"].to_numpy(),
+            df["primary_dir_mil_y"].to_numpy(),
+            df["primary_dir_mil_z"].to_numpy(),
+        ]).T
+        cloud["principal_direction_mil"] = vec_mil
+
+    if all(c in df.columns for c in ["primary_dir_mil_anat_1", "primary_dir_mil_anat_2", "primary_dir_mil_anat_3"]):
+        vec_mil_anat = np.vstack([
+            df["primary_dir_mil_anat_1"].to_numpy(),
+            df["primary_dir_mil_anat_2"].to_numpy(),
+            df["primary_dir_mil_anat_3"].to_numpy(),
+        ]).T
+        cloud["principal_direction_mil_anatomical"] = vec_mil_anat
+
+    if "DA_ST" in df.columns and "principal_direction" in cloud.array_names:
+        cloud["dir_weighted"] = cloud["principal_direction"] * df["DA_ST"].to_numpy()[:, None]
+
+    if "DA_MIL" in df.columns and "principal_direction_mil" in cloud.array_names:
+        cloud["dir_weighted_mil"] = cloud["principal_direction_mil"] * df["DA_MIL"].to_numpy()[:, None]
 
     cloud.save(out_path)
     return out_path
@@ -677,17 +1146,92 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     print("Custom anatomical frame present:", custom_frame_basis is not None)
     print("Custom long axis present:", custom_long_axis is not None)
 
-    print("Computing EDT...")
-    edt = ndimage.distance_transform_edt(bone, sampling=spacing)
+    print("Computing trabecular thickness EDT...")
+    # For thickness, optionally prevent voxels outside TRABFILL from acting as
+    # biologically meaningful background. This avoids artificially reducing
+    # thickness for trabecular voxels near the TRABFILL boundary.
+    if getattr(args, "ignore_trabfill_boundary_for_thickness", True) and filled_mask is not None:
+        thickness_edt_mask = (bone > 0) | (~filled_mask.astype(bool))
+        edt = ndimage.distance_transform_edt(thickness_edt_mask, sampling=spacing)
+        print("Thickness EDT mode: outside TRABFILL ignored as background")
+    else:
+        edt = ndimage.distance_transform_edt(bone, sampling=spacing)
+        print("Thickness EDT mode: standard bone-mask EDT")
     print("EDT min/max:", float(np.min(edt)), float(np.max(edt)))
+
+    spacing_edt = None
+    if getattr(args, "calculate_trabecular_spacing", True):
+        print("Computing trabecular spacing EDT...")
+        # Tb.Sp is estimated from the distance transform of marrow space inside
+        # TRABFILL. Optionally, outside-TRABFILL voxels are treated as valid
+        # non-background so that the compartment boundary does not artificially
+        # reduce spacing values near the boundary.
+        if filled_mask is not None:
+            marrow_inside_trabfill = filled_mask.astype(bool) & (~(bone > 0))
+            if getattr(args, "ignore_trabfill_boundary_for_spacing", True):
+                spacing_edt_mask = marrow_inside_trabfill | (~filled_mask.astype(bool))
+                print("Spacing EDT mode: outside TRABFILL ignored as background")
+            else:
+                spacing_edt_mask = marrow_inside_trabfill
+                print("Spacing EDT mode: marrow inside TRABFILL only")
+        else:
+            spacing_edt_mask = ~(bone > 0)
+            print("Spacing EDT mode: standard inverse bone mask")
+        spacing_edt = ndimage.distance_transform_edt(spacing_edt_mask, sampling=spacing)
+        print("Spacing EDT min/max:", float(np.min(spacing_edt)), float(np.max(spacing_edt)))
+
+    filled_boundary_edt = None
+    if getattr(args, "save_boundary_diagnostics", True) and filled_mask is not None:
+        print("Computing TRABFILL boundary-distance EDT...")
+        filled_boundary_edt = ndimage.distance_transform_edt(filled_mask.astype(bool), sampling=spacing)
 
     st_components = None
     if args.use_structure_tensor:
         print("Computing structure tensor...")
-        st_image = edt.astype(np.float32) * bone.astype(np.float32)
+        if getattr(args, "clip_non_bvtv_to_filled_mask", True) and filled_mask is not None:
+            st_valid_bone = (bone > 0) & filled_mask.astype(bool)
+            print("Structure tensor mode: clipped to trabecular bone inside TRABFILL")
+        else:
+            st_valid_bone = bone > 0
+            print("Structure tensor mode: standard bone mask")
+        st_image = edt.astype(np.float32) * st_valid_bone.astype(np.float32)
         st_components = structure_tensor_components_3d(st_image, sigma=args.st_sigma)
         del st_image
         gc.collect()
+
+        if getattr(args, "save_mapping_debug_images", False):
+            debug_dir = Path(args.out_dir).parent / "segmentations" / f"{getattr(args, 'object', 'object')}_DEBUG"
+
+            print("Saving mapping debug images to:", debug_dir)
+
+            save_debug_mid_slices(
+                edt,
+                debug_dir,
+                "DEBUG_mapping_EDT",
+                mask=filled_mask
+            )
+
+            Jzz, Jzy, Jzx, Jyy, Jyx, Jxx = st_components
+            st_trace = Jzz + Jyy + Jxx
+
+            save_debug_mid_slices(
+                st_trace,
+                debug_dir,
+                "DEBUG_mapping_ST_trace",
+                mask=filled_mask
+            )
+
+            if spacing_edt is not None:
+                save_debug_mid_slices(
+                    spacing_edt,
+                    debug_dir,
+                    "DEBUG_mapping_spacing_EDT",
+                    mask=filled_mask
+                )
+
+            del st_trace
+            gc.collect()
+
         for i, comp in enumerate(st_components, start=1):
             print(f"Component {i}: shape={comp.shape}, min={float(np.nanmin(comp)):.6g}, max={float(np.nanmax(comp)):.6g}")
     else:
@@ -702,22 +1246,80 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     sphere_offsets = precompute_sphere_offsets(args.sphere_radius, spacing)
     print("Number of sphere offsets:", sphere_offsets.shape[0])
 
+    mil_directions = None
+    mil_line_spacing = None
+    mil_sample_step = None
+    mil_valid_length = 0.0
+    if getattr(args, "use_mil_anisotropy", False):
+        mil_power = getattr(args, "mil_power", None)
+        if mil_power not in [None, "", "None"]:
+            mil_n_directions = int(8 * (4 ** int(mil_power)))
+        else:
+            mil_n_directions = int(getattr(args, "mil_n_directions", 31))
+        mil_directions = fibonacci_hemisphere_directions(mil_n_directions)
+
+        min_spacing = float(min(spacing))
+        mil_length_units = str(getattr(args, "mil_length_units", "mm")).lower()
+
+        raw_line_spacing = getattr(args, "mil_line_spacing", None)
+        raw_sample_step = getattr(args, "mil_sample_step", None)
+        raw_valid_length = getattr(args, "mil_valid_length", 0.0)
+
+        if raw_line_spacing in [None, "", "None"]:
+            raw_line_spacing = 5.0 if str(getattr(args, "mil_method", "standard")).lower() == "medtool" else 1.0
+        if raw_sample_step in [None, "", "None"]:
+            raw_sample_step = raw_line_spacing
+        if raw_valid_length in [None, "", "None"]:
+            raw_valid_length = 0.0
+
+        if mil_length_units == "voxels":
+            mil_line_spacing = float(raw_line_spacing) * min_spacing
+            mil_sample_step = float(raw_sample_step) * min_spacing
+            mil_valid_length = float(raw_valid_length) * min_spacing
+        else:
+            mil_line_spacing = float(raw_line_spacing)
+            mil_sample_step = float(raw_sample_step)
+            mil_valid_length = float(raw_valid_length)
+
+        print(
+            "MIL anisotropy enabled: "
+            f"method={getattr(args, 'mil_method', 'standard')}, "
+            f"{len(mil_directions)} directions, line_spacing={mil_line_spacing} mm, "
+            f"sample_step={mil_sample_step} mm, valid_length={mil_valid_length} mm, "
+            f"fabric_shape={getattr(args, 'mil_fabric_shape', 'ellipsoid')}, "
+            f"norm_type={getattr(args, 'mil_norm_type', 'det')}, "
+            f"da_mode={getattr(args, 'mil_da_mode', 'bounded')}"
+        )
+    else:
+        print("MIL anisotropy disabled.")
+
     def zero_or_nan_row(center, inside_mask, use_zero=False):
         val = 0.0 if use_zero else np.nan
         return {
             "center_z_vox": center[0], "center_y_vox": center[1], "center_x_vox": center[2],
             "center_z_phys": center[0] * spacing[0], "center_y_phys": center[1] * spacing[1], "center_x_phys": center[2] * spacing[2],
             "inside_filled_mask": 1 if inside_mask else 0,
+            "valid_trabfill_voxels_in_sphere": val,
+            "total_voxels_in_sphere": val,
+            "valid_fraction_trabfill": val,
+            "distance_to_trabfill_boundary_mm": val,
+            "distance_to_trabfill_boundary_vox": val,
             "BVTV": val,
-            "TbTh_mean_local": val,
-            "TbTh_p90_local": val,
-            "TbTh_p95_local": val,
-            "TbTh_max_local": val,
+            "EDTThickness_mean": val,
+            "EDTThickness_max": val,
+            "EDTSpacing_mean": val,
+            "EDTSpacing_max": val,
             "primary_dir_st_z": val, "primary_dir_st_y": val, "primary_dir_st_x": val,
-            "eig_st_1": val, "eig_st_2": val, "eig_st_3": val, "anisotropy_st": val,
+            "DA_ST_eig_1": val, "DA_ST_eig_2": val, "DA_ST_eig_3": val, "DA_ST": val,
             "angle_to_custom_long_axis_deg": val,
             "custom_long_axis_z": val, "custom_long_axis_y": val, "custom_long_axis_x": val,
             "primary_dir_st_anat_1": val, "primary_dir_st_anat_2": val, "primary_dir_st_anat_3": val,
+            "primary_dir_mil_z": val, "primary_dir_mil_y": val, "primary_dir_mil_x": val,
+            "DA_MIL_eig_1": val, "DA_MIL_eig_2": val, "DA_MIL_eig_3": val, "DA_MIL": val,
+            "mean_intercept_length_mil": val, "mil_valid_directions": val,
+            "mil_total_intersections": val, "mil_total_line_length": val,
+            "angle_mil_to_custom_long_axis_deg": val,
+            "primary_dir_mil_anat_1": val, "primary_dir_mil_anat_2": val, "primary_dir_mil_anat_3": val,
         }
 
     def analyze_one_center_local(center):
@@ -734,15 +1336,48 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
 
         bone_vals = bone[z, y, x]
         bvtv = bvtv_in_sphere_using_filled_mask(z, y, x, bone, filled_mask=filled_mask)
-        local_bone_mask = bone_vals > 0
 
-        tbth_mean = tbth_p90 = tbth_p95 = tbth_max = np.nan
+        total_voxels_in_sphere = int(len(z))
+        if filled_mask is not None:
+            valid_trabfill_mask = filled_mask[z, y, x] > 0
+        else:
+            valid_trabfill_mask = np.ones_like(bone_vals, dtype=bool)
+        valid_trabfill_voxels = int(np.count_nonzero(valid_trabfill_mask))
+        valid_fraction_trabfill = (
+            float(valid_trabfill_voxels / total_voxels_in_sphere)
+            if total_voxels_in_sphere > 0 else np.nan
+        )
+
+        if filled_boundary_edt is not None:
+            distance_to_boundary_mm = float(filled_boundary_edt[center])
+            distance_to_boundary_vox = float(distance_to_boundary_mm / min(spacing)) if min(spacing) > 0 else np.nan
+        else:
+            distance_to_boundary_mm = np.nan
+            distance_to_boundary_vox = np.nan
+
+        local_bone_mask_raw = bone_vals > 0
+        if getattr(args, "clip_non_bvtv_to_filled_mask", True):
+            local_bone_mask = local_bone_mask_raw & valid_trabfill_mask
+        else:
+            local_bone_mask = local_bone_mask_raw
+
+        tbth_mean = tbth_max = np.nan
         if np.any(local_bone_mask):
             local_thickness_vals = 2.0 * edt[z[local_bone_mask], y[local_bone_mask], x[local_bone_mask]]
             tbth_mean = float(np.mean(local_thickness_vals))
-            tbth_p90 = float(np.percentile(local_thickness_vals, 90))
-            tbth_p95 = float(np.percentile(local_thickness_vals, 95))
             tbth_max = float(np.max(local_thickness_vals))
+
+        tbsp_mean = tbsp_max = np.nan
+        if spacing_edt is not None:
+            local_marrow_mask_raw = ~(bone_vals > 0)
+            if getattr(args, "clip_non_bvtv_to_filled_mask", True):
+                local_marrow_mask = local_marrow_mask_raw & valid_trabfill_mask
+            else:
+                local_marrow_mask = local_marrow_mask_raw
+            if np.any(local_marrow_mask):
+                local_spacing_vals = 2.0 * spacing_edt[z[local_marrow_mask], y[local_marrow_mask], x[local_marrow_mask]]
+                tbsp_mean = float(np.mean(local_spacing_vals))
+                tbsp_max = float(np.max(local_spacing_vals))
 
         eig_st = [np.nan, np.nan, np.nan]
         dir_st = np.array([np.nan, np.nan, np.nan], dtype=float)
@@ -768,7 +1403,43 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
         if anat_basis is not None:
             dir_st_anat = enforce_sign_convention(transform_vector_to_anatomical(dir_st, anat_basis))
 
+        eig_mil = np.array([np.nan, np.nan, np.nan], dtype=float)
+        dir_mil = np.array([np.nan, np.nan, np.nan], dtype=float)
+        aniso_mil = np.nan
+        mean_mil = np.nan
+        mil_valid_directions = 0
+        mil_total_intersections = 0
+        mil_total_line_length = 0.0
+        if getattr(args, "use_mil_anisotropy", False) and np.any(local_bone_mask):
+            mil_result = local_mil_fabric(
+                bone=bone,
+                center=center,
+                radius_phys=float(args.sphere_radius),
+                spacing=spacing,
+                directions=mil_directions,
+                line_spacing=float(mil_line_spacing),
+                sample_step=float(mil_sample_step),
+                min_intersections=int(getattr(args, "mil_min_intersections", 2)),
+                da_mode=str(getattr(args, "mil_da_mode", "bounded")),
+                method=str(getattr(args, "mil_method", "standard")),
+                valid_length=float(mil_valid_length),
+                fabric_shape=str(getattr(args, "mil_fabric_shape", "ellipsoid")),
+                norm_type=str(getattr(args, "mil_norm_type", "det")),
+            )
+            eig_mil = mil_result["eig"]
+            dir_mil = mil_result["dir"]
+            aniso_mil = mil_result["anisotropy"]
+            mean_mil = mil_result["mean_mil"]
+            mil_valid_directions = mil_result["valid_directions"]
+            mil_total_intersections = mil_result["total_intersections"]
+            mil_total_line_length = mil_result["total_line_length"]
+
+        dir_mil_anat = np.array([np.nan, np.nan, np.nan], dtype=float)
+        if anat_basis is not None:
+            dir_mil_anat = enforce_sign_convention(transform_vector_to_anatomical(dir_mil, anat_basis))
+
         angle_custom = angle_to_axis_degrees(dir_st, custom_long_axis)
+        angle_mil_custom = angle_to_axis_degrees(dir_mil, custom_long_axis)
         if custom_long_axis is None:
             custom_axis_z = custom_axis_y = custom_axis_x = np.nan
         else:
@@ -778,16 +1449,27 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             "center_z_vox": center[0], "center_y_vox": center[1], "center_x_vox": center[2],
             "center_z_phys": center[0] * spacing[0], "center_y_phys": center[1] * spacing[1], "center_x_phys": center[2] * spacing[2],
             "inside_filled_mask": 1 if inside_mask else 0,
+            "valid_trabfill_voxels_in_sphere": valid_trabfill_voxels,
+            "total_voxels_in_sphere": total_voxels_in_sphere,
+            "valid_fraction_trabfill": valid_fraction_trabfill,
+            "distance_to_trabfill_boundary_mm": distance_to_boundary_mm,
+            "distance_to_trabfill_boundary_vox": distance_to_boundary_vox,
             "BVTV": bvtv,
-            "TbTh_mean_local": tbth_mean,
-            "TbTh_p90_local": tbth_p90,
-            "TbTh_p95_local": tbth_p95,
-            "TbTh_max_local": tbth_max,
+            "EDTThickness_mean": tbth_mean,
+            "EDTThickness_max": tbth_max,
+            "EDTSpacing_mean": tbsp_mean,
+            "EDTSpacing_max": tbsp_max,
             "primary_dir_st_z": dir_st[0], "primary_dir_st_y": dir_st[1], "primary_dir_st_x": dir_st[2],
-            "eig_st_1": eig_st[0], "eig_st_2": eig_st[1], "eig_st_3": eig_st[2], "anisotropy_st": aniso_st,
+            "DA_ST_eig_1": eig_st[0], "DA_ST_eig_2": eig_st[1], "DA_ST_eig_3": eig_st[2], "DA_ST": aniso_st,
             "angle_to_custom_long_axis_deg": angle_custom,
             "custom_long_axis_z": custom_axis_z, "custom_long_axis_y": custom_axis_y, "custom_long_axis_x": custom_axis_x,
             "primary_dir_st_anat_1": dir_st_anat[0], "primary_dir_st_anat_2": dir_st_anat[1], "primary_dir_st_anat_3": dir_st_anat[2],
+            "primary_dir_mil_z": dir_mil[0], "primary_dir_mil_y": dir_mil[1], "primary_dir_mil_x": dir_mil[2],
+            "DA_MIL_eig_1": eig_mil[0], "DA_MIL_eig_2": eig_mil[1], "DA_MIL_eig_3": eig_mil[2], "DA_MIL": aniso_mil,
+            "mean_intercept_length_mil": mean_mil, "mil_valid_directions": mil_valid_directions,
+            "mil_total_intersections": mil_total_intersections, "mil_total_line_length": mil_total_line_length,
+            "angle_mil_to_custom_long_axis_deg": angle_mil_custom,
+            "primary_dir_mil_anat_1": dir_mil_anat[0], "primary_dir_mil_anat_2": dir_mil_anat[1], "primary_dir_mil_anat_3": dir_mil_anat[2],
         }
 
     results = []
@@ -804,9 +1486,22 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     results_df = pd.DataFrame(results)
     print("Finished sphere analysis. Rows:", len(results_df))
 
-    # Add object-level BV/TV normalized variables before writing CSV/VTP/mesh outputs.
-    # These are calculated from the finite BVTV values saved for this object.
-    results_df = add_bvtv_derived_columns(results_df)
+    # Derived BV/TV variables. These are calculated from the valid BVTV values
+    # for the current object and are written to both CSV outputs.
+    if "BVTV" in results_df.columns:
+        bvtv_vals = pd.to_numeric(results_df["BVTV"], errors="coerce")
+        mean_bvtv = float(bvtv_vals.mean(skipna=True))
+        sd_bvtv = float(bvtv_vals.std(skipna=True))
+        min_bvtv = float(bvtv_vals.min(skipna=True))
+        max_bvtv = float(bvtv_vals.max(skipna=True))
+
+        results_df["rBVTV"] = bvtv_vals / mean_bvtv if np.isfinite(mean_bvtv) and mean_bvtv != 0 else np.nan
+        results_df["BVTV_zscore"] = (bvtv_vals - mean_bvtv) / sd_bvtv if np.isfinite(sd_bvtv) and sd_bvtv != 0 else np.nan
+        results_df["BVTV_minmax"] = (
+            (bvtv_vals - min_bvtv) / (max_bvtv - min_bvtv)
+            if np.isfinite(min_bvtv) and np.isfinite(max_bvtv) and max_bvtv != min_bvtv
+            else np.nan
+        )
 
     csv_path = out_dir / prefixed_name(args, "trabecular_results.csv")
     results_df.to_csv(csv_path, index=False)
@@ -842,7 +1537,7 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
         paint_mask = results_df["inside_filled_mask"].to_numpy() == 1
         kept_centers_dense = [c for c, keep in zip(kept_centers, paint_mask) if keep]
         results_df_dense = results_df.loc[paint_mask].reset_index(drop=True)
-        for var in [v for v in ["BVTV", "rBVTV", "BVTV_zscore", "BVTV_minmax", "TbTh_mean_local", "TbTh_p90_local", "TbTh_p95_local", "TbTh_max_local", "anisotropy_st", "angle_to_custom_long_axis_deg"] if v in results_df_dense.columns]:
+        for var in [v for v in ["BVTV", "rBVTV", "BVTV_zscore", "BVTV_minmax", "valid_fraction_trabfill", "distance_to_trabfill_boundary_mm", "distance_to_trabfill_boundary_vox", "EDTThickness_mean", "EDTThickness_max", "EDTSpacing_mean", "EDTSpacing_max", "DA_ST", "angle_to_custom_long_axis_deg", "DA_MIL", "mean_intercept_length_mil", "angle_mil_to_custom_long_axis_deg"] if v in results_df_dense.columns]:
             if args.dense_map_mode == "local_sphere":
                 vol = local_sphere_heatmap(bone.shape, kept_centers_dense, results_df_dense[var].tolist(), args.sphere_radius, spacing)
             else:
@@ -1016,13 +1711,329 @@ def transfer_csv_to_mesh(mesh, df: pd.DataFrame, value_columns=None, target="cel
     return mesh
 
 
-def make_tetra_mesh(args, spacing):
+
+def _smooth_surface(surface, iterations: int, relaxation: float):
+    """Smooth a PyVista surface with a conservative fallback between versions."""
+    if iterations is None or int(iterations) <= 0:
+        return surface
+    try:
+        return surface.smooth(
+            n_iter=int(iterations),
+            relaxation_factor=float(relaxation),
+            feature_smoothing=False,
+            boundary_smoothing=True,
+        ).clean().triangulate()
+    except TypeError:
+        return surface.smooth(n_iter=int(iterations), relaxation_factor=float(relaxation)).clean().triangulate()
+
+
+def _decimate_surface(surface, target_reduction: float):
+    """Decimate a PyVista PolyData surface while trying to preserve topology."""
+    target_reduction = float(target_reduction)
+    if target_reduction <= 0:
+        return surface
+    target_reduction = min(target_reduction, 0.99)
+    try:
+        return surface.decimate_pro(target_reduction, preserve_topology=True).clean().triangulate()
+    except TypeError:
+        return surface.decimate_pro(target_reduction).clean().triangulate()
+
+
+def save_surface_mesh_binary(surface, out_path: Path) -> None:
+    """Save surface mesh, using binary output when supported."""
+    try:
+        surface.save(str(out_path), binary=True)
+    except TypeError:
+        surface.save(str(out_path))
+
+
+def make_smoothed_decimated_surface_mesh(volume: np.ndarray, spacing, args, label: str, out_path: Path):
+    """Create a smoothed, decimated surface mesh from a binary stack.
+
+    The input stack is interpreted in z,y,x array order. The output surface is in
+    x,y,z physical coordinates, matching the other ParaView outputs.
+    """
+    if pv is None:
+        raise ImportError("pyvista is required for surface mesh export. Install with: pip install pyvista")
+
+    volume = (volume > 0).astype(np.uint8)
+
+    if getattr(args, "surface_mesh_keep_largest_component", True):
+        print(f"Keeping largest connected component for {label} surface mesh...")
+        volume = keep_largest_component(volume)
+
+    pad_width = int(getattr(args, "surface_mesh_pad_width", 1))
+    if pad_width > 0:
+        print(f"Padding {label} surface volume by {pad_width} voxels...")
+        volume = pad_binary_volume(volume, pad_width=pad_width)
+        origin_xyz = (
+            -pad_width * spacing[2],
+            -pad_width * spacing[1],
+            -pad_width * spacing[0],
+        )
+    else:
+        origin_xyz = (0.0, 0.0, 0.0)
+
+    print(f"Extracting {label} surface mesh...")
+    base_surface = binary_to_surface_mesh(volume, spacing_zyx=spacing, origin_xyz=origin_xyz)
+    base_surface = base_surface.clean().triangulate()
+    print(f"{label} original surface: {base_surface.n_points} points, {base_surface.n_cells} cells")
+
+    reductions = [float(getattr(args, "surface_mesh_target_reduction", 0.90))]
+    max_mb = getattr(args, "surface_mesh_max_file_size_mb", None)
+    if max_mb is not None and float(max_mb) > 0:
+        for extra in [0.95, 0.97, 0.98, 0.99]:
+            if extra > reductions[0] and extra not in reductions:
+                reductions.append(extra)
+
+    last_surface = None
+    last_path = None
+    for reduction in reductions:
+        surface = base_surface.copy()
+        surface = _smooth_surface(
+            surface,
+            iterations=int(getattr(args, "surface_mesh_smooth_iterations", 30)),
+            relaxation=float(getattr(args, "surface_mesh_smooth_relaxation", 0.05)),
+        )
+        if getattr(args, "surface_mesh_decimate", True):
+            surface = _decimate_surface(surface, reduction)
+        surface = surface.clean().triangulate()
+
+        save_surface_mesh_binary(surface, out_path)
+        size_mb = out_path.stat().st_size / (1024 * 1024)
+        print(
+            f"Saved {label} surface mesh: {out_path} "
+            f"({surface.n_points} points, {surface.n_cells} cells, {size_mb:.2f} MB, reduction={reduction})"
+        )
+        last_surface = surface
+        last_path = out_path
+
+        if max_mb is None or float(max_mb) <= 0 or size_mb <= float(max_mb):
+            break
+
+    return last_path, last_surface
+
+
+def export_surface_meshes_for_object(args, spacing, segmentations_dir: Path) -> list[str]:
+    """Export smoothed/decimated surface meshes for configured segmentation stacks."""
+    if not getattr(args, "make_surface_meshes", False):
+        return []
+
+    suffixes = getattr(args, "surface_mesh_suffixes", ["_FILL", "_TRABFILL"])
+    if isinstance(suffixes, str):
+        suffixes = [s.strip() for s in suffixes.split(",") if s.strip()]
+
+    out_dir = Path(args.out_dir) / str(getattr(args, "surface_mesh_output_dir_name", "surface_meshes"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fmt = str(getattr(args, "surface_mesh_file_format", "vtp")).lower().lstrip(".")
+    written = []
+
+    for suffix in suffixes:
+        try:
+            stack_folder = find_single_folder_ending(segmentations_dir, suffix)
+            label = suffix.lstrip("_")
+            out_path = out_dir / prefixed_name(args, f"{label}_surface.{fmt}")
+            print(f"Creating {label} surface mesh from: {stack_folder}")
+            volume = load_binary_volume(str(stack_folder))
+            path, _surface = make_smoothed_decimated_surface_mesh(
+                volume=volume,
+                spacing=spacing,
+                args=args,
+                label=label,
+                out_path=out_path,
+            )
+            written.append(str(path))
+
+            # Optional companion STL export. STL stores only triangle geometry
+            # and is useful for downstream mesh software, while VTP remains the
+            # preferred ParaView/PyVista format.
+            if getattr(args, "surface_mesh_save_stl", False):
+                stl_path = out_path.with_suffix(".stl")
+                save_surface_mesh_binary(_surface.triangulate().clean(), stl_path)
+                stl_size_mb = stl_path.stat().st_size / (1024 * 1024)
+                print(
+                    f"Saved {label} STL surface mesh: {stl_path} "
+                    f"({_surface.n_points} points, {_surface.n_cells} cells, {stl_size_mb:.2f} MB)"
+                )
+                written.append(str(stl_path))
+
+            del volume, _surface
+            gc.collect()
+        except Exception as e:
+            msg = f"Surface mesh export failed for suffix {suffix}: {e}"
+            if getattr(args, "surface_mesh_fail_on_error", True):
+                raise RuntimeError(msg) from e
+            print("WARNING:", msg)
+
+    return written
+
+
+def _scale_cgal_length(value, spacing, units="voxels"):
+    """Convert Medtool-like CGAL length setting to mm.
+
+    Medtool-style parameters are often given in voxels. TrabMap stores voxel
+    spacing in mm, so voxel-based values are converted to physical units here.
+    """
+    if value is None:
+        return None
+    value = float(value)
+    if units == "voxels":
+        # Current mapping assumes isotropic voxels because the runner supplies
+        # one voxel_size. Use the mean for safety if spacing becomes anisotropic.
+        return value * float(np.mean(spacing))
+    if units == "mm":
+        return value
+    raise ValueError('cgal_length_units must be "voxels" or "mm".')
+
+
+def _meshio_to_pyvista_tetra(meshio_mesh):
+    """Convert a meshio tetrahedral mesh to a PyVista UnstructuredGrid."""
+    if pv is None:
+        raise ImportError("pyvista is required to convert/save CGAL meshes. Install with: pip install pyvista")
+
+    tetra_blocks = []
+    for block in meshio_mesh.cells:
+        if block.type in ["tetra", "tetra4"]:
+            tetra_blocks.append(np.asarray(block.data, dtype=np.int64))
+
+    if len(tetra_blocks) == 0:
+        available = [block.type for block in meshio_mesh.cells]
+        raise RuntimeError(f"CGAL mesh did not contain tetrahedral cells. Cell types found: {available}")
+
+    tets = np.vstack(tetra_blocks).astype(np.int64)
+    cells = np.hstack([np.full((tets.shape[0], 1), 4, dtype=np.int64), tets]).ravel()
+    celltypes = np.full(tets.shape[0], pv.CellType.TETRA, dtype=np.uint8)
+    points = np.asarray(meshio_mesh.points, dtype=float)
+    return pv.UnstructuredGrid(cells, celltypes, points)
+
+
+def make_cgal_mesh(args, spacing):
+    """Create a Medtool-like image-domain tetrahedral mesh using pygalmesh/CGAL.
+
+    This backend meshes the binary TRABFILL image domain directly rather than
+    first creating a dense surface and then filling it. The key Medtool-like
+    control is cgal_max_element_size, which acts as the target/maximum internal
+    tetrahedron size through CGAL's max_cell_circumradius parameter.
+    """
+    global pv
+    if pv is None:
+        raise ImportError("pyvista is required for mesh export. Install with: pip install pyvista")
+    try:
+        import pygalmesh  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "CGAL-style meshing requires pygalmesh, which is an optional dependency. "
+            "Use mesh_backend='tetgen' or install pygalmesh/CGAL in a compatible environment."
+        ) from e
+
+    out_dir = Path(args.out_dir)
+    csv_path = out_dir / prefixed_name(args, "trabecular_results.csv")
+    out_mesh_path = Path(args.mesh_out) if args.mesh_out else out_dir / prefixed_name(args, "trabecular_tetra_mesh.vtk")
+
+    print("Loading filled volume for CGAL mesh...")
+    volume = load_binary_volume(args.filled_mask if args.filled_mask else str(out_dir / prefixed_name(args, "auto_filled_mask.tif")))
+    print_volume_diagnostics(volume, name="CGAL original volume")
+
+    if args.mesh_largest_component:
+        print("Keeping largest connected component...")
+        volume = keep_largest_component(volume).astype(bool)
+        print_volume_diagnostics(volume, name="CGAL largest-component volume")
+
+    # Pad the volume so the object is fully separated from image boundaries.
+    print(f"Padding volume by {args.mesh_pad_width} voxels...")
+    volume = pad_binary_volume(volume.astype(np.uint8), pad_width=args.mesh_pad_width).astype(np.uint8)
+    print_volume_diagnostics(volume, name="CGAL padded volume")
+
+    units = getattr(args, "cgal_length_units", "voxels")
+    max_cell = _scale_cgal_length(getattr(args, "cgal_max_element_size", 5.0), spacing, units)
+    facet_size = _scale_cgal_length(getattr(args, "cgal_facet_size", 5.0), spacing, units)
+    facet_distance = _scale_cgal_length(getattr(args, "cgal_facet_distance", 0.5), spacing, units)
+    facet_angle = float(getattr(args, "cgal_facet_angle", 30.0))
+
+    # pygalmesh expects voxel_size in x,y,z order. TrabMap spacing is z,y,x.
+    voxel_size_xyz = (float(spacing[2]), float(spacing[1]), float(spacing[0]))
+
+    print("Generating CGAL image-domain tetrahedral mesh...")
+    print(f"  cgal_length_units: {units}")
+    print(f"  max_cell_circumradius / max element size: {max_cell} mm")
+    print(f"  max_facet_size: {facet_size} mm")
+    print(f"  max_facet_distance: {facet_distance} mm")
+    print(f"  min_facet_angle: {facet_angle} degrees")
+
+    # pygalmesh API names have been stable for generate_from_array, but some
+    # optional optimization flags vary by version. Try the complete call first,
+    # then fall back to the core parameters if needed.
+    print("pygalmesh version:", pygalmesh.__version__)
+    
+    try:
+        meshio_mesh = pygalmesh.generate_from_array(
+            volume,
+            voxel_size=voxel_size_xyz,
+            max_facet_distance=facet_distance,
+            max_cell_circumradius=max_cell,
+            verbose=bool(getattr(args, "cgal_verbose", False)),
+        )
+    except TypeError as e:
+        raise RuntimeError(
+            f"Unsupported pygalmesh version. Error was:\n{e}"
+        )
+    # pygalmesh follows NumPy array axis order, but TrabMap volumes are z,y,x.
+    # Reorder to x,y,z so the CGAL mesh matches TetGen/VTP/STL outputs.
+    meshio_mesh.points = meshio_mesh.points[:, [2, 1, 0]]
+
+    # Correct for the padding added before meshing.
+    meshio_mesh.points[:, 0] -= args.mesh_pad_width * spacing[2]
+    meshio_mesh.points[:, 1] -= args.mesh_pad_width * spacing[1]
+    meshio_mesh.points[:, 2] -= args.mesh_pad_width * spacing[0]
+
+    tetmesh = _meshio_to_pyvista_tetra(meshio_mesh)
+
+    if tetmesh.n_cells < 100:
+        raise RuntimeError(
+            f"CGAL tetrahedral mesh looks suspiciously small ({tetmesh.n_cells} cells). "
+            "Try lowering cgal_max_element_size, checking the TRABFILL mask, or disabling largest-component filtering."
+        )
+
+    print("Loading sphere CSV...")
+    df = pd.read_csv(csv_path)
+    required = {"center_x_phys", "center_y_phys", "center_z_phys"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing required coordinate columns: {missing}")
+    print("CSV rows:", len(df))
+
+    value_columns = None if args.mesh_value_columns is None else [x.strip() for x in args.mesh_value_columns.split(",") if x.strip()]
+    print(f"Transferring CSV values to CGAL mesh ({args.mesh_target}, {args.mesh_method})...")
+    tetmesh = transfer_csv_to_mesh(
+        tetmesh, df, value_columns=value_columns, target=args.mesh_target,
+        method=args.mesh_method, k=args.mesh_k, power=args.mesh_power
+    )
+
+    # Store backend metadata as field data where VTK supports it.
+    try:
+        tetmesh.field_data["mesh_backend"] = np.array(["cgal"])
+        tetmesh.field_data["cgal_max_element_size_mm"] = np.array([max_cell], dtype=float)
+        tetmesh.field_data["cgal_facet_size_mm"] = np.array([facet_size], dtype=float)
+        tetmesh.field_data["cgal_facet_distance_mm"] = np.array([facet_distance], dtype=float)
+    except Exception:
+        pass
+
+    print(f"Saving CGAL tetrahedral mesh to: {out_mesh_path}")
+    tetmesh.save(str(out_mesh_path))
+    print("Saved CGAL mesh:")
+    print(tetmesh)
+    return tetmesh
+
+
+def make_tetgen_mesh(args, spacing):
+    """Create tetrahedral mesh with the existing TetGen surface-first backend."""
     require_mesh_imports()
     out_dir = Path(args.out_dir)
     csv_path = out_dir / prefixed_name(args, "trabecular_results.csv")
     out_mesh_path = Path(args.mesh_out) if args.mesh_out else out_dir / prefixed_name(args, "trabecular_tetra_mesh.vtk")
 
-    print("Loading filled volume for mesh...")
+    print("Loading filled volume for TetGen mesh...")
     volume = load_binary_volume(args.filled_mask if args.filled_mask else str(out_dir / prefixed_name(args, "auto_filled_mask.tif")))
     print_volume_diagnostics(volume, name="original volume")
 
@@ -1057,12 +2068,12 @@ def make_tetra_mesh(args, spacing):
         print("Uniform remeshing with pyacvd...")
         surface = remesh_surface_with_pyacvd(surface, n_surf=args.pyacvd_n_surf, subdivide=args.pyacvd_subdivide, verbose=True)
 
-    print("Tetrahedralizing...")
+    print("Tetrahedralizing with TetGen...")
     tetmesh = tetrahedralize_surface(surface, switches=args.tetgen_switches, verbose=True)
     if tetmesh.n_cells < 100:
         raise RuntimeError(
             f"Tetrahedral mesh looks suspiciously small ({tetmesh.n_cells} cells). "
-            "Try increasing --mesh-pad-width, enabling --meshfix, lowering --pyacvd-n-surf, or changing --tetgen-switches."
+            "Try increasing mesh_pad_width, enabling meshfix, lowering pyacvd_n_surf, or changing tetgen_switches."
         )
 
     print("Loading sphere CSV...")
@@ -1074,16 +2085,80 @@ def make_tetra_mesh(args, spacing):
     print("CSV rows:", len(df))
 
     value_columns = None if args.mesh_value_columns is None else [x.strip() for x in args.mesh_value_columns.split(",") if x.strip()]
-    print(f"Transferring CSV values to mesh ({args.mesh_target}, {args.mesh_method})...")
+    print(f"Transferring CSV values to TetGen mesh ({args.mesh_target}, {args.mesh_method})...")
     tetmesh = transfer_csv_to_mesh(
         tetmesh, df, value_columns=value_columns, target=args.mesh_target,
         method=args.mesh_method, k=args.mesh_k, power=args.mesh_power
     )
 
-    print(f"Saving tetrahedral mesh to: {out_mesh_path}")
+    try:
+        tetmesh.field_data["mesh_backend"] = np.array(["tetgen"])
+    except Exception:
+        pass
+
+    print(f"Saving TetGen tetrahedral mesh to: {out_mesh_path}")
     tetmesh.save(str(out_mesh_path))
-    print("Saved mesh:")
+    print("Saved TetGen mesh:")
     print(tetmesh)
+    return tetmesh
+
+
+def make_tetra_mesh(args, spacing):
+    """Dispatch tetrahedral mesh creation to selected backend."""
+    backend = getattr(args, "mesh_backend", "tetgen")
+    print(f"Mesh backend: {backend}")
+    if backend == "tetgen":
+        return make_tetgen_mesh(args, spacing)
+    if backend == "cgal":
+        return make_cgal_mesh(args, spacing)
+    raise ValueError('mesh_backend must be "tetgen" or "cgal".')
+
+
+
+# =============================================================================
+# Save diagnistic images for debugging
+# =============================================================================
+
+
+def normalize_to_uint8_for_debug(arr: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """Normalize an array to 8-bit for visual debug TIFFs."""
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if mask is not None:
+        vals = arr[np.asarray(mask, dtype=bool)]
+    else:
+        vals = arr[np.isfinite(arr)]
+
+    vals = vals[np.isfinite(vals)]
+
+    if vals.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    vmin = float(np.percentile(vals, 1))
+    vmax = float(np.percentile(vals, 99))
+
+    if vmax <= vmin:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    out = (arr - vmin) / (vmax - vmin)
+    out = np.clip(out, 0, 1)
+    return (out * 255).astype(np.uint8)
+
+
+def save_debug_mid_slices(arr: np.ndarray, out_dir: Path, name: str, mask: Optional[np.ndarray] = None) -> None:
+    """Save Z/Y/X mid-slices of a 3D array as 8-bit TIFFs."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    arr8 = normalize_to_uint8_for_debug(arr, mask=mask)
+
+    z_mid = arr8.shape[0] // 2
+    y_mid = arr8.shape[1] // 2
+    x_mid = arr8.shape[2] // 2
+
+    tifffile.imwrite(out_dir / f"{name}_Zmid.tif", arr8[z_mid])
+    tifffile.imwrite(out_dir / f"{name}_Ymid.tif", arr8[:, y_mid, :])
+    tifffile.imwrite(out_dir / f"{name}_Xmid.tif", arr8[:, :, x_mid])
 
 
 
@@ -1186,6 +2261,7 @@ def copy_settings_for_object(
     d["spacing_x"] = float(voxel_size)
     d["object"] = object_name
     d["output_prefix"] = f"{object_name}_"
+    d["segmentations_dir"] = str(trab_folder.parent)
 
     if (
         custom_long_axis_p1_xyz is not None
@@ -1215,6 +2291,38 @@ def simple_setting_value(value):
     if isinstance(value, (tuple, list)):
         return ",".join(str(x) for x in value)
     return value
+
+
+
+def flatten_config_values(config, prefix=""):
+    """Flatten a config dictionary/list into key-value pairs for runner CSV logging."""
+    if config is None:
+        return {}
+    if isinstance(config, SimpleNamespace):
+        config = vars(config)
+    flat = {}
+    if isinstance(config, dict):
+        for key, value in config.items():
+            safe_key = str(key).strip().replace(" ", "_").replace("-", "_")
+            new_prefix = f"{prefix}_{safe_key}" if prefix else safe_key
+            flat.update(flatten_config_values(value, new_prefix))
+    elif isinstance(config, (list, tuple)):
+        flat[prefix] = simple_setting_value(config)
+    else:
+        flat[prefix] = simple_setting_value(config)
+    return flat
+
+
+def write_config_values_to_runner_row(df: pd.DataFrame, row_index, args) -> None:
+    """Add/update every user-supplied config value in the runner dataframe."""
+    config_values = getattr(args, "config_values", None)
+    if not config_values:
+        return
+    for key, value in flatten_config_values(config_values).items():
+        col = f"config_{key}"
+        if col not in df.columns:
+            df[col] = ""
+        df.at[row_index, col] = simple_setting_value(value)
 
 
 def write_settings_to_runner_row(df: pd.DataFrame, row_index, args) -> None:
@@ -1263,7 +2371,7 @@ def run_from_runner(base_settings):
     if missing:
         raise ValueError(f"Runner CSV is missing required columns: {missing}")
 
-    for col in ["status", "error_message", "input_folder", "filled_mask_folder", "output_folder", "custom_anatomical_frame_used", "custom_long_axis_used"]:
+    for col in ["status", "error_message", "input_folder", "filled_mask_folder", "output_folder", "custom_anatomical_frame_used", "custom_long_axis_used", "surface_meshes_status", "surface_meshes_files"]:
         if col not in runner.columns:
             runner[col] = ""
 
@@ -1331,9 +2439,24 @@ def run_from_runner(base_settings):
             runner.at[row_index, "status"] = "running"
             runner.at[row_index, "error_message"] = ""
             write_settings_to_runner_row(runner, row_index, args)
+            write_config_values_to_runner_row(runner, row_index, args)
             save_runner(runner, runner_csv, delimiter)
 
             results_df, kept_centers, bone, filled_mask, spacing = analyze_spheres(args)
+
+            surface_mesh_files = []
+            if getattr(args, "make_surface_meshes", False):
+                surface_mesh_files = export_surface_meshes_for_object(
+                    args=args,
+                    spacing=spacing,
+                    segmentations_dir=Path(args.segmentations_dir),
+                )
+                runner.at[row_index, "surface_meshes_status"] = "finished"
+                runner.at[row_index, "surface_meshes_files"] = " | ".join(surface_mesh_files)
+                write_settings_to_runner_row(runner, row_index, args)
+                write_config_values_to_runner_row(runner, row_index, args)
+                save_runner(runner, runner_csv, delimiter)
+
             if args.make_mesh:
                 make_tetra_mesh(args, spacing)
 
@@ -1341,6 +2464,7 @@ def run_from_runner(base_settings):
             runner.at[row_index, "status"] = "finished"
             runner.at[row_index, "error_message"] = ""
             write_settings_to_runner_row(runner, row_index, args)
+            write_config_values_to_runner_row(runner, row_index, args)
             save_runner(runner, runner_csv, delimiter)
             print(f"Finished object: {object_name}")
 
@@ -1377,5 +2501,8 @@ def run_from_config(config):
     """Run batch mapping after applying a config dictionary to SETTINGS."""
     from .config import namespace_from_defaults
     args = namespace_from_defaults(SETTINGS, config)
+    # Preserve the raw user-supplied YAML/JSON values so every configurable
+    # input can be written back to the runner CSV for reproducibility.
+    args.config_values = dict(config)
     validate_settings(args)
     return run_from_runner(args)

@@ -7,15 +7,25 @@ dependencies:
   - pandas
   - scipy
   - scikit-image
-  - tifffile
-  - simpleitk
-  - pyyaml
   - matplotlib
+  - pyyaml  
+  - tifffile
+
+  - simpleitk
+  - nibabel
+
+  - vtk
   - pyvista
+  - meshio
+  - tetgen
+  - pymeshfix
+  - pyacvd
+
+  - pygalmesh
+
+  - openpyxl
+
+  - tqdm
   - pip
   - pip:
-      - nibabel
-      - tetgen
-      - pymeshfix
-      - pyacvd
       - -e .

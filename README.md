@@ -71,17 +71,6 @@ The mapping step reads folders ending with `*_TRAB` and `*_TRABFILL` from the se
 input/OBJECT_NAME/mappings/
 ```
 
-When `make_surface_meshes: true`, the mapping step also writes smoothed and
-decimated surface meshes for `_FILL` and `_TRABFILL` to:
-
-```text
-input/OBJECT_NAME/mappings/surface_meshes/
-```
-
-By default each surface is saved as both `.vtp` and `.stl`. VTP is preferred
-for ParaView/PyVista workflows, while STL is useful for downstream mesh
-software that expects triangle geometry only.
-
 ## Basic use
 
 Edit `config/trabmap_config.yaml` first, especially:
@@ -110,58 +99,3 @@ Equivalent script-wrapper commands:
 python scripts/run_segmentation.py --config config/trabmap_config.yaml
 python scripts/run_mapping.py --config config/trabmap_config.yaml
 ```
-
-## What changed from previous versions:
-
-- Parameters are now stored and can be altered in `config/trabmap_config.yaml`.
-- Multiple working scripts were converted into importable modules.
-
-
-## Surface mesh outputs
-
-The mapping step can also export smoothed and decimated surface meshes from the segmentation stacks. By default, it creates surfaces for:
-
-```text
-input/OBJECT_NAME/segmentations/OBJECT_NAME_FILL/
-input/OBJECT_NAME/segmentations/OBJECT_NAME_TRABFILL/
-```
-
-and writes them to:
-
-```text
-input/OBJECT_NAME/mappings/surface_meshes/
-├── OBJECT_NAME_FILL_surface.vtp
-└── OBJECT_NAME_TRABFILL_surface.vtp
-```
-
-These outputs are controlled in `config/trabmap_config.yaml` under the `mapping:` section:
-
-```yaml
-make_surface_meshes: true
-surface_mesh_suffixes: [_FILL, _TRABFILL]
-surface_mesh_smooth_iterations: 30
-surface_mesh_smooth_relaxation: 0.05
-surface_mesh_decimate: true
-surface_mesh_target_reduction: 0.90
-surface_mesh_max_file_size_mb: 5.0
-```
-
-Increase `surface_mesh_target_reduction` for smaller files, or decrease it for more detailed surfaces.
-
-## Reproducibility logging
-
-During mapping, TrabMap writes two types of provenance columns back to the runner CSV:
-
-- `setting_*` columns record the object-specific settings actually used for that row.
-- `config_*` columns record every user-supplied value from the `mapping:` section of the YAML/JSON config file.
-
-This makes the runner CSV an analysis log that records both the input data paths and all configurable mapping parameters used for each object.
-
-## Notes
-
-The mapping module has optional dependencies for mesh export: `pyvista`, `tetgen`, `pymeshfix`, and `pyacvd`. If you only need CSV/VTP outputs, you can set `make_mesh: false` in the config.
-
-The following are non-standard trabecular properties that are useful for comparing interspecific variation in bone volume fraction across whole bones:
-- rBVTV = BVTV / mean(BVTV)
-- BVTV_zscore = (BVTV - mean(BVTV)) / sd(BVTV)
-- BVTV_minmax = (BVTV - min(BVTV)) / (max(BVTV) - min(BVTV))

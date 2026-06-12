@@ -46,8 +46,45 @@ mapping:
   margin: null
   center_inclusion_mode: skip_outside
 
+  # Boundary handling for non-BV/TV measurements.
+  # BV/TV already ignores voxels outside TRABFILL in its denominator.
+  # These settings apply the same logic to trabecular thickness and to the
+  # local samples used for structure-tensor anisotropy. Boundary diagnostics
+  # are saved so boundary VOIs can be evaluated rather than excluded.
+  clip_non_bvtv_to_filled_mask: true
+  ignore_trabfill_boundary_for_thickness: true
+  save_boundary_diagnostics: true
+  save_mapping_debug_images: false
+
+  # Trabecular spacing, calculated as 2 * EDT(marrow space inside TRABFILL).
+  # The boundary-aware mode treats voxels outside TRABFILL as outside the
+  # analysis compartment rather than as true marrow/background.
+  calculate_trabecular_spacing: true
+  ignore_trabfill_boundary_for_spacing: true
+
   use_structure_tensor: true
   st_sigma: 1.0
+
+  # Optional Mean Intercept Length (MIL) anisotropy.
+  # This is much slower than the structure-tensor method, so the default is false.
+  # If true, TrabMap adds anisotropy_mil, primary_dir_mil_z/y/x,
+  # primary_dir_mil_anat_1/2/3, and related diagnostic columns.
+  use_mil_anisotropy: true
+
+  # MIL mode. Use "medtool" to approximate Medtool defaults as closely as possible.
+  # Medtool defaults: -fabm MIL, -faba ellipsoid, -fabn det,
+  # -morp step=5;power=2;validLength=0.
+  mil_method: medtool        # "standard" or "medtool"
+  mil_power: 2              # Medtool power; directions = 8 * 4^power = 128
+  mil_n_directions: 128     # used only when mil_power is null
+  mil_length_units: voxels  # Medtool step/validLength are in voxels
+  mil_line_spacing: 5       # Medtool -morp step default
+  mil_sample_step: 5        # ray sampling step; use 5 for closest Medtool-like behavior
+  mil_valid_length: 0       # Medtool -morp validLength default
+  mil_min_intersections: 0  # legacy TrabMap setting; ignored by mil_method: medtool
+  mil_fabric_shape: ellipsoid
+  mil_norm_type: det
+  mil_da_mode: bounded        # use bounded for 0-1 visualization, ratio for Medtool-like DA from 1-inf;
 
   use_crop: false
   crop_z: [0, 300]
@@ -81,6 +118,19 @@ mapping:
   surface_mesh_fail_on_error: true
 
   make_mesh: true
+
+  # Tetrahedral mesh backend:
+  # tetgen = surface-first PyVista/TetGen workflow
+  # cgal = optional Medtool-like image-domain CGAL workflow via pygalmesh
+  mesh_backend: cgal
+
+  # CGAL / Medtool-like image-domain mesh settings. Used only when mesh_backend: cgal.
+  # cgal_length_units can be voxels or mm. Voxels is closest to Medtool-style settings.
+  cgal_length_units: mm
+  cgal_max_element_size: 1.0   # internal tetrahedron size / max cell circumradius
+  cgal_facet_distance: 0.3     # surface approximation tolerance
+  cgal_verbose: false
+
   mesh_out: null
   mesh_target: cells
   mesh_method: idw
