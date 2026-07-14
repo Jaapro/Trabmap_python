@@ -75,7 +75,7 @@ mapping:
   # Medtool defaults: -fabm MIL, -faba ellipsoid, -fabn det,
   # -morp step=5;power=2;validLength=0.
   mil_method: medtool        # "standard" or "medtool"
-  mil_power: 2              # Medtool power; directions = 8 * 4^power = 128
+  mil_power: 2              # deaukt power is 2. sMedtool power; directions = 8 * 4^power = 128
   mil_n_directions: 128     # used only when mil_power is null
   mil_length_units: voxels  # Medtool step/validLength are in voxels
   mil_line_spacing: 5       # Medtool -morp step default
