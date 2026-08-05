@@ -1,5 +1,3 @@
-# trabmap_batch_clean_simpleitk_segmentation.py
-
 import os
 import gc
 import numpy as np
@@ -7,13 +5,17 @@ import pandas as pd
 import tifffile as tiff
 
 from scipy import ndimage as ndi
-from skimage import morphology
+from skimage import morphology, filters
 import SimpleITK as sitk
 
 
 # ============================================================
 # USER SETTINGS
 # ============================================================
+
+# these are default values for the script. 
+# these values are overwritten by their equivalents in the
+# config.yaml file
 
 RUNNER_CSV = "trabmap_runner.csv"
 
@@ -24,6 +26,17 @@ SEGMENTED_COLUMN = "segmented"
 VOXEL_SIZE_COLUMN = "voxel_size"
 
 INPUT_FOLDER_SUFFIX = "_TRABCORT"
+RAW_FOLDER_SUFFIX = "_RAW"
+AUTO_SEGMENT_RAW = True
+RAW_SEGMENTATION_METHOD = "otsu"  # "otsu", "multiotsu", or "manual"
+RAW_MANUAL_THRESHOLD = None
+RAW_MULTIOTSU_CLASSES = 3
+RAW_BONE_CLASS_MIN = 2
+RAW_USE_MEDIAN_FILTER = True
+RAW_MEDIAN_SIZE_VOXELS = (1, 3, 3)
+RAW_KEEP_LARGEST_COMPONENT = True
+RAW_MIN_OBJECT_SIZE = 1000
+RAW_SAVE_THRESHOLD_DEBUG = True
 
 PERIOSTEAL_THRESHOLD = 1
 ENDOSTEAL_THRESHOLD = 1
@@ -53,7 +66,7 @@ SURFACE_HOLE_CLOSE_RADIUS_MM = 0.70 # default is 0.70
 # keep only the largest connected void in the internal compartment before dilation and erosion steps. prevents small holes in cortex missed by cortex protection to be included in the internal filled area
 KEEP_LARGEST_INTERNAL_VOID_COMPONENT = True
 
-# Lightly close tiny cortical holes before subtracting from FILL
+# close tiny cortical holes before subtracting from FILL
 # default 0.05, change to 0.10 or 0.15 if cortex isnt properly filled. 
 # set to lower value if trabecular bone structure is verz dense
 PROTECTED_BONE_CLOSE_RADIUS_MM = 0.05 
@@ -65,8 +78,10 @@ INTERNAL_FILL_MODE = "3d"  # "3d" or "2d"
 
 KEEP_LARGEST_TRABFILL_COMPONENT = True
 
-# Erosion and dilation steps can slightly change the geometry of trabfill, causing thin parts of the cortex to be assigned to trabecular mask. 
-# this setting removes thin sheets of pixels sometimes accidentally assigned to TRAB
+# Erosion and dilation steps can slightly change the geometry of trabfill,
+# causing thin parts of the cortex to be assigned to trabecular mask. 
+# this setting removes thin sheets of pixels sometimes accidentally 
+# assigned to TRAB and assigns them to cort
 REMOVE_THIN_TRAB_EDGE_LINES = True 
 THIN_TRAB_OPEN_RADIUS_VOXELS = 1
 
@@ -129,6 +144,8 @@ def remove_small_objects_3d(mask, min_size):
         mask.astype(bool),
         min_size=min_size
     )
+
+
 
 
 def fill_internal_voids_2d(mask):
@@ -340,7 +357,7 @@ def read_stack(folder, image_extensions=(".tif", ".tiff", ".png", ".jpg", ".jpeg
         img = tiff.imread(os.path.join(folder, f))
         stack.append(img)
 
-    return np.stack(stack, axis=0).astype(np.uint8)
+    return np.stack(stack, axis=0)
 
 
 def save_stack_from_crop(mask_crop, full_shape, bbox, folder, prefix):
@@ -378,9 +395,132 @@ def save_middle_slices(mask, debug_folder, name):
     tiff.imwrite(os.path.join(debug_folder, f"{name}_Xmid.tif"), mask_uint8[:, :, x_mid])
 
 
+def save_binary_stack(mask, folder, prefix):
+    os.makedirs(folder, exist_ok=True)
+    mask_u8 = mask.astype(np.uint8) * 255
+    for z in range(mask_u8.shape[0]):
+        tiff.imwrite(os.path.join(folder, f"{prefix}_{z:04d}.tif"), mask_u8[z])
+
+
+def save_raw_threshold_debug(raw_volume, binary_mask, debug_folder, object_name):
+    if not RAW_SAVE_THRESHOLD_DEBUG or debug_folder is None:
+        return
+    os.makedirs(debug_folder, exist_ok=True)
+
+    def norm8(arr):
+        arr = np.asarray(arr, dtype=np.float32)
+        vals = arr[np.isfinite(arr)]
+        if vals.size == 0:
+            return np.zeros(arr.shape, dtype=np.uint8)
+        lo, hi = np.percentile(vals, [1, 99])
+        if hi <= lo:
+            return np.zeros(arr.shape, dtype=np.uint8)
+        return (np.clip((arr-lo)/(hi-lo), 0, 1)*255).astype(np.uint8)
+
+    raw_u8 = norm8(raw_volume)
+    mask_u8 = binary_mask.astype(np.uint8) * 255
+    zmid, ymid, xmid = [s // 2 for s in raw_volume.shape]
+    for plane, rs, ms in [
+        ("Zmid", raw_u8[zmid], mask_u8[zmid]),
+        ("Ymid", raw_u8[:, ymid, :], mask_u8[:, ymid, :]),
+        ("Xmid", raw_u8[:, :, xmid], mask_u8[:, :, xmid]),
+    ]:
+        tiff.imwrite(os.path.join(debug_folder, f"{object_name}_RAW_{plane}.tif"), rs)
+        tiff.imwrite(os.path.join(debug_folder, f"{object_name}_RAW_segmented_{plane}.tif"), ms)
+
+
+def segment_raw_volume(raw_volume):
+    method = str(RAW_SEGMENTATION_METHOD).strip().lower()
+    raw = np.asarray(raw_volume)
+    vals = raw[np.isfinite(raw)]
+    if vals.size == 0:
+        raise RuntimeError("RAW volume contains no finite intensity values.")
+
+    if method == "otsu":
+        threshold = float(filters.threshold_otsu(vals))
+        bone = raw >= threshold
+        threshold_used = threshold
+    elif method == "multiotsu":
+        classes = int(RAW_MULTIOTSU_CLASSES)
+        thresholds = filters.threshold_multiotsu(vals, classes=classes)
+        labels = np.digitize(raw, bins=thresholds)
+        min_class = int(RAW_BONE_CLASS_MIN)
+        if not 0 <= min_class < classes:
+            raise RuntimeError(f"RAW_BONE_CLASS_MIN must be between 0 and {classes-1}.")
+        bone = labels >= min_class
+        threshold_used = ",".join(str(float(x)) for x in thresholds)
+    elif method == "manual":
+        if RAW_MANUAL_THRESHOLD is None:
+            raise RuntimeError("RAW_MANUAL_THRESHOLD must be set for manual thresholding.")
+        threshold = float(RAW_MANUAL_THRESHOLD)
+        bone = raw >= threshold
+        threshold_used = threshold
+    else:
+        raise RuntimeError("RAW_SEGMENTATION_METHOD must be 'otsu', 'multiotsu', or 'manual'.")
+
+    bone = bone.astype(bool)
+    if RAW_USE_MEDIAN_FILTER:
+        bone = ndi.median_filter(bone.astype(np.uint8), size=tuple(RAW_MEDIAN_SIZE_VOXELS)).astype(bool)
+    if int(RAW_MIN_OBJECT_SIZE) > 0:
+        bone = remove_small_objects_3d(bone, int(RAW_MIN_OBJECT_SIZE))
+    if RAW_KEEP_LARGEST_COMPONENT:
+        bone = largest_component(bone)
+    if not np.any(bone):
+        raise RuntimeError("RAW segmentation produced an empty mask.")
+    return bone, threshold_used
+
+
 # ============================================================
 # FOLDER FINDERS
 # ============================================================
+
+def find_raw_folder(object_name):
+    object_folder = os.path.join(INPUT_ROOT, object_name)
+    if not os.path.exists(object_folder):
+        print(f"  Object folder missing: {object_folder}")
+        return None
+    subfolders = [f for f in os.listdir(object_folder) if os.path.isdir(os.path.join(object_folder, f))]
+    candidates = [f for f in subfolders if f.endswith(RAW_FOLDER_SUFFIX)]
+    if not candidates:
+        print(f"  No *{RAW_FOLDER_SUFFIX} folder found.")
+        return None
+    if len(candidates) > 1:
+        print(f"  WARNING: multiple *{RAW_FOLDER_SUFFIX} folders found. Using: {candidates[0]}")
+    return os.path.join(object_folder, candidates[0])
+
+
+def ensure_trabcort_folder(object_name, debug_folder=None):
+    existing = find_trabcort_folder(object_name)
+    if existing is not None:
+        print("  WARNING: existing TRABCORT folder found; automatic RAW segmentation skipped.")
+        return existing, "existing", None
+    if not AUTO_SEGMENT_RAW:
+        print("  No TRABCORT folder found and AUTO_SEGMENT_RAW is disabled.")
+        return None, "disabled", None
+    raw_folder = find_raw_folder(object_name)
+    if raw_folder is None:
+        print("  No TRABCORT or RAW folder found.")
+        return None, "missing", None
+
+    print(f"  RAW folder found: {raw_folder}")
+    raw_volume = read_stack(raw_folder)
+    print(f"  RAW volume shape: {raw_volume.shape}; dtype: {raw_volume.dtype}")
+    print(f"  RAW intensity range: {float(np.nanmin(raw_volume))} to {float(np.nanmax(raw_volume))}")
+    trabcort_mask, threshold_used = segment_raw_volume(raw_volume)
+
+    output_name = object_name + INPUT_FOLDER_SUFFIX
+    output_folder = os.path.join(INPUT_ROOT, object_name, output_name)
+    if os.path.exists(output_folder):
+        print("  WARNING: TRABCORT folder appeared before save; using existing folder.")
+        return output_folder, "existing", None
+
+    print(f"  Saving automatically segmented TRABCORT stack: {output_folder}")
+    save_binary_stack(trabcort_mask, output_folder, output_name)
+    save_raw_threshold_debug(raw_volume, trabcort_mask, debug_folder, object_name)
+    del raw_volume, trabcort_mask
+    gc.collect()
+    return output_folder, str(RAW_SEGMENTATION_METHOD).strip().lower(), threshold_used
+
 
 def find_trabcort_folder(object_name):
     object_folder = os.path.join(INPUT_ROOT, object_name)
@@ -516,7 +656,7 @@ def segment_bone(
     gc.collect()
 
     # --------------------------------------------------------
-    # Step 2: protected bone
+    # Step 2: protected bone small (holes closed in cortex)
     # --------------------------------------------------------
 
     print("  Closing small holes ...")
@@ -655,7 +795,7 @@ def flatten_config_values(config, prefix=""):
 
 
 def write_config_values_to_runner_row(df, idx):
-    """Write every user-supplied segmentation config value to the runner CSV."""
+    """Log every user-supplied segmentation config value to the runner CSV."""
     if not CONFIG_VALUES:
         return
     for key, value in flatten_config_values(CONFIG_VALUES).items():
@@ -700,29 +840,36 @@ def main():
             print(f"  {e}")
             continue
 
-        input_folder = find_trabcort_folder(object_name)
+        output_folder = os.path.join(INPUT_ROOT, object_name, "segmentations")
+        os.makedirs(output_folder, exist_ok=True)
+        debug_folder = os.path.join(output_folder, object_name + "_DEBUG")
+
+        try:
+            input_folder, raw_status, raw_threshold = ensure_trabcort_folder(
+                object_name, debug_folder=debug_folder
+            )
+        except Exception as e:
+            print("  RAW SEGMENTATION FAILED")
+            print(e)
+            continue
 
         if input_folder is None:
             continue
 
-        manual_fill_folder = find_optional_fill_folder(object_name)
+        if "raw_segmentation_status" not in df.columns:
+            df["raw_segmentation_status"] = ""
+        if "raw_segmentation_threshold" not in df.columns:
+            df["raw_segmentation_threshold"] = ""
+        df.loc[idx, "raw_segmentation_status"] = raw_status
+        if raw_threshold is not None:
+            df.loc[idx, "raw_segmentation_threshold"] = raw_threshold
 
+        manual_fill_folder = find_optional_fill_folder(object_name)
         if manual_fill_folder is not None:
             print(f"  Manual FILL folder found: {manual_fill_folder}")
         else:
             print("  No manual FILL folder found. Will compute FILL automatically.")
-
         print(f"  Input folder: {input_folder}")
-
-        output_folder = os.path.join(
-            INPUT_ROOT,
-            object_name,
-            "segmentations"
-        )
-        
-        os.makedirs(output_folder, exist_ok=True)
-
-        debug_folder = os.path.join(output_folder, object_name + "_DEBUG")
 
         try:
             print("  Reading stack...")
@@ -799,9 +946,7 @@ if __name__ == "__main__":
 
 def run_from_config(config):
     """Run batch segmentation after applying a config dictionary.
-
-    This keeps the original tested functions intact, but removes the need to edit
-    paths or parameters inside the source code. Config keys may be lower-case
+    Config keys may be lower-case
     YAML names such as `runner_csv` or the original uppercase names such as
     `RUNNER_CSV`.
     """

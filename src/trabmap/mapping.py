@@ -1,10 +1,10 @@
 """
-Trabmap local script: calculates BV/TV, trabecular thickness, structure tensor direction,
-ParaView VTP export, and optional tetrahedral VTK mesh export and surface meshes
+Trabmap local script: calculates BV/TV, EDT derived trabecular thickness and spacing, 
+structure tensor direction, ParaView VTP export, and optional tetrahedral VTK mesh export and surface meshes
 
-The script reads trabmap_runner.csv, finds rows where finished is not equal to "yes",
-auto-detects the matching _TRAB and _TRABFILL folders, runs Trabmap, prefixes
-outputs with the object name, and writes the settings/status back to the runner CSV.
+The script reads trabmap_runner.csv, finds rows where the finished column value
+is not equal to "yes", auto-detects the matching _TRAB and _TRABFILL folders, 
+runs Trabmap, prefixes outputs with the object name, and writes the settings/status back to the runner CSV.
 
 Notes:
 - Input and filled-mask can be a folder of .tif/.tiff slices, a 3D .tif/.tiff stack, or a .npy file.
@@ -49,7 +49,7 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # Batch runner paths
     # -------------------------------------------------------------------------
-    # CSV file with at least these columns: finished, object, voxel_size.
+    # CSV file needs to have at least these columns: finished, object, voxel_size.
     # The uploaded example uses semicolons, which this script detects automatically.
     runner_csv="trabmap_runner.csv",
 
@@ -62,7 +62,7 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # Optional anatomical landmarks
     # -------------------------------------------------------------------------
-    # no longer used, to remove.
+    # no longer used, will be  removed.
     # instead use the runner file to give two sets of x,y,z coordinates of long 
     # axis and one set for the rotational axis
     landmarks_csv=None,
@@ -75,7 +75,7 @@ SETTINGS = SimpleNamespace(
     # landmark_long_2_x, landmark_long_2_y, landmark_long_2_z,
     # landmark_rotate_x, landmark_rotate_y, landmark_rotate_z.
     #
-    # The two long-axis landmarks define anatomical axis 1.
+    # The two long-axis landmark coordinate sets define anatomical long axis.
     # this can be used to determine the orientation of the trabecular structure
     # relative to a specified long axis defined by two points and a rotation axis
     # defined byy another point
@@ -103,15 +103,15 @@ SETTINGS = SimpleNamespace(
     # What to do with grid centers outside the filled mask:
     # "skip_outside" = ignore them; "zero_outside" = keep them with zero values.
     # skip outside is a sensible default, zero outside is to make output
-    # comparable to ORS Dragonfly (but is not advised!)
+    # comparable to ORS Dragonfly (but is not advised)
     center_inclusion_mode="skip_outside",
 
     # -------------------------------------------------------------------------
     # Boundary handling for non-BV/TV measurements
     # -------------------------------------------------------------------------
     # BV/TV already uses only TRABFILL voxels in the denominator. These settings
-    # apply similar TRABFILL clipping to trabecular thickness and structure-tensor
-    # anisotropy so that voxels outside the anatomical trabecular compartment do
+    # apply similar TRABFILL sphere clipping to trabecular thickness and structure-tensor
+    # anisotropy so that voxels outside the internal TRABFILL compartment do
     # not contribute to these local measurements.
     clip_non_bvtv_to_filled_mask=True,
     ignore_trabfill_boundary_for_thickness=True,
@@ -132,24 +132,16 @@ SETTINGS = SimpleNamespace(
     # Structure tensor settings
     # -------------------------------------------------------------------------
     # st_sigma controls the amount of Gaussian smoothing applied before 
-    # calculating the structure tensor anisotropy (DA_ST). The value is 
-    # specified in voxels and determines the spatial scale over which 
-    # trabecular orientation is estimated. Increasing st_sigma causes 
-    # anisotropy to reflect larger-scale architectural trends and reduces noise
-    # sensitivity, but may blur fine local variation. Decreasing st_sigma 
-    # increases spatial resolution and sensitivity to local features, but may 
-    # produce noisier anisotropy estimates. A value of 1.0 voxel generally 
-    # provides a good balance between robustness and spatial detail.
+    # calculating the structure tensor anisotropy (DA_ST). default is 0.10mm
     use_structure_tensor=True,
-    st_sigma=1.0,
+    st_sigma=0.10,
 
     # -------------------------------------------------------------------------
     # Optional Mean Intercept Length (MIL) anisotropy settings
     # -------------------------------------------------------------------------
-    # This is slower than the structure-tensor method, especially for small
-    # grid steps and many specimens. It adds separate MIL columns and does not
-    # replace the existing structure-tensor outputs.
-    use_mil_anisotropy=False,
+    # This is slower than the structure-tensor method but is the standard across the field
+    # It adds separate MIL columns and does not replace the existing structure-tensor outputs.
+    use_mil_anisotropy=True,
 
     # MIL mode. "standard" is the original Trabmap implementation.
     # "medtool" uses settings and fabric fitting chosen to mimic Medtool's
@@ -163,7 +155,8 @@ SETTINGS = SimpleNamespace(
     mil_min_intersections=2,
     mil_da_mode="bounded",       # "bounded" = 1 - lambda_min/lambda_max; "ratio" = lambda_max/lambda_min
 
-    # Medtool-like MIL settings. Medtool's -morp defaults are:
+    # Settings to mimic medtools parameters as far as known. 
+    # Medtool's -morp defaults are:
     # step=5 voxels, power=2 -> 8*4^2 = 128 directions, validLength=0.
     # Medtool's -faba default is ellipsoid, -fabm default is MIL, and -fabn
     # default is determinant normalization.
@@ -233,7 +226,7 @@ SETTINGS = SimpleNamespace(
     mesh_power=2.0,
 
     # Comma-separated string of columns to map, or None for all numeric non-coordinate columns.
-    # Example: "BVTV,EDTThickness_mean,DA_ST"
+    # Example: "BVTV,EDTThickness_mean,DA_ST". import vlues from config yaml file
     mesh_value_columns=None,
 
     mesh_pad_width=20,
@@ -244,6 +237,7 @@ SETTINGS = SimpleNamespace(
     pyacvd_subdivide=0,
     tetgen_switches="pq1.2Q", # original value, likely results in many vertices on outside fewer inside but smaller file size
     #tetgen_switches="pq1.2a0.05Q" # .05Q constrains inside vertex size, making them more equal to the surface of the mesh, reduce to make intenral even smaller
+    # you should probablz use cgal instead anyway
 )
 
 
@@ -288,6 +282,7 @@ def prefixed_name(args, filename: str) -> str:
 # General helpers
 # =============================================================================
 
+# check if runner file is open, else it cannot save parameters
 def check_runner_csv_writable(csv_path):
     try:
         with open(csv_path, "a"):
@@ -443,7 +438,7 @@ def build_custom_anatomical_frame(args, spacing: tuple):
     image arrays use z,y,x order, so this function converts x,y,z pixels to
     z,y,x physical coordinates before calculating the frame.
 
-    Returns
+    Returns the following
     -------
     tuple
         (anat_basis, long_axis), where anat_basis columns are axis1, axis2,
@@ -493,6 +488,7 @@ def angle_to_axis_degrees(v_image: np.ndarray, axis_image: Optional[np.ndarray])
     Because trabecular orientation is axial rather than directional, v and -v are
     treated as equivalent. Output is therefore constrained to 0-90 degrees.
     in other words, a trabec poiting up is the same as a trabec pointing down
+    this prevents arbitrary differences in trabecular direction
     """
     if axis_image is None:
         return np.nan
@@ -562,7 +558,7 @@ def mil_for_direction_in_sphere(
     sample_step: float,
     min_intersections: int = 2,
 ) -> tuple[float, int, float]:
-    """Original TrabMap MIL estimate for one direction within a spherical ROI.
+    """Original Trabmap MIL estimate for one direction within a spherical ROI.
 
     This legacy mode counts binary transitions along parallel test lines and
     returns total sampled test-line length divided by the number of transitions.
@@ -636,8 +632,7 @@ def _binary_run_lengths(vals: np.ndarray, sample_step: float) -> list[float]:
         while j < n and vals[j]:
             j += 1
         # If a run contains k sampled points, its chord length is approximated as
-        # k * sample_step. This is intentionally simple and Medtool-like because
-        # Medtool's morphological algorithm operates on sampled rays in voxel units.
+        # k * sample_step. This is because I believe Medtool's algorithm operates on sampled rays in voxel units.
         lengths.append(float((j - i) * sample_step))
         i = j
     return lengths
@@ -653,17 +648,17 @@ def mil_for_direction_in_sphere_medtool(
     sample_step: float,
     valid_length: float = 0.0,
 ) -> tuple[float, int, float]:
-    """Medtool-like MIL for one direction within a spherical ROI.
+    """Medtool-like MIL settings for one direction within a spherical ROI.
 
     Medtool's morphology options define a ray-field spacing (``step``), number
     of directions, and minimum valid intercept length (``validLength``). This
     function therefore estimates MIL as the mean length of valid bone chords
     intercepted by a parallel ray field. Chords shorter than ``valid_length`` are
-    ignored. ``valid_length=0`` reproduces Medtool's permissive default.
+    ignored. ``valid_length=0`` reproduces Medtool's default.
 
     This is not going to be identical to Medtool because the exact
     proprietary ray generation and ellipsoid fitting details are not available,
-    but it is much closer than the previous implementation.
+    but it is closer than the previous implementation
     """
     d = unit_vector(np.asarray(direction, dtype=float))
     if d is None:
@@ -723,7 +718,7 @@ def mil_for_direction_in_sphere_medtool(
 
 
 def _normalize_fabric_eigenvalues(eig: np.ndarray, norm_type: str) -> np.ndarray:
-    """Normalize fabric eigenvalues in a Medtool-like way."""
+    """Normalize fabric eigenvalues"""
     eig = np.asarray(eig, dtype=float).copy()
     if np.any(~np.isfinite(eig)) or np.any(eig <= 0):
         return eig
@@ -740,7 +735,7 @@ def _normalize_fabric_eigenvalues(eig: np.ndarray, norm_type: str) -> np.ndarray
 def _ellipsoid_fabric_from_mil(directions: np.ndarray, mils: np.ndarray, norm_type: str) -> tuple[np.ndarray, np.ndarray]:
     """Fit an ellipsoid to directional MIL values.
 
-    We fit the quadratic form d.T A d = 1 / MIL(d)^2. The ellipsoid radii are
+    fit the quadratic form d.T A d = 1 / MIL(d)^2. The ellipsoid radii are
     then 1/sqrt(eigenvalues(A)). These radii are used as fabric eigenvalues,
     sorted from smallest to largest. The eigenvector associated with the largest
     radius is the principal MIL direction.
@@ -823,8 +818,8 @@ def local_mil_fabric(
     method="standard" keeps the older Trabmap transition-count approach.
     method="medtool" uses a chord-length ray-field approach with ellipsoid
     fitting and determinant normalization, matching Medtool defaults as closely
-    as possible from public option descriptions. Still not exactly the same as 
-    medtool due to missing information on the exact algorithm
+    as possible from public descriptions. Still not exactly the same as 
+    medtool due to missing information on the exact algorithm but closer than before
     """
     mils = []
     valid_dirs = []
@@ -1147,7 +1142,7 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     print("Custom long axis present:", custom_long_axis is not None)
 
     print("Computing trabecular thickness EDT...")
-    # For thickness, optionally prevent voxels outside TRABFILL from acting as
+    # For thickness, this prevent voxels outside TRABFILL from acting as
     # biologically meaningful background. This avoids artificially reducing
     # thickness for trabecular voxels near the TRABFILL boundary.
     if getattr(args, "ignore_trabfill_boundary_for_thickness", True) and filled_mask is not None:
@@ -1195,7 +1190,11 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             st_valid_bone = bone > 0
             print("Structure tensor mode: standard bone mask")
         st_image = edt.astype(np.float32) * st_valid_bone.astype(np.float32)
-        st_components = structure_tensor_components_3d(st_image, sigma=args.st_sigma)
+        sigma_vox = float(args.st_sigma) / min(spacing)
+        st_components = structure_tensor_components_3d(
+            st_image,
+            sigma=sigma_vox
+        )
         del st_image
         gc.collect()
 
@@ -1845,9 +1844,9 @@ def export_surface_meshes_for_object(args, spacing, segmentations_dir: Path) -> 
             )
             written.append(str(path))
 
-            # Optional companion STL export. STL stores only triangle geometry
-            # and is useful for downstream mesh software, while VTP remains the
-            # preferred ParaView/PyVista format.
+            # Optional STL export. STL stores only triangle geometry
+            # and is useful for downstream mesh software, while VTP can be used in
+            # Paraview
             if getattr(args, "surface_mesh_save_stl", False):
                 stl_path = out_path.with_suffix(".stl")
                 save_surface_mesh_binary(_surface.triangulate().clean(), stl_path)
@@ -1870,10 +1869,9 @@ def export_surface_meshes_for_object(args, spacing, segmentations_dir: Path) -> 
 
 
 def _scale_cgal_length(value, spacing, units="voxels"):
-    """Convert Medtool-like CGAL length setting to mm.
+    """Convert CGAL length setting to mm.
 
-    Medtool-style parameters are often given in voxels. TrabMap stores voxel
-    spacing in mm, so voxel-based values are converted to physical units here.
+    Trabmap stores voxel spacing in mm, so voxel-based values are converted to physical units here.
     """
     if value is None:
         return None
@@ -1909,11 +1907,11 @@ def _meshio_to_pyvista_tetra(meshio_mesh):
 
 
 def make_cgal_mesh(args, spacing):
-    """Create a Medtool-like image-domain tetrahedral mesh using pygalmesh/CGAL.
+    """Create a tetrahedral mesh using pygalmesh/CGAL.
 
     This backend meshes the binary TRABFILL image domain directly rather than
-    first creating a dense surface and then filling it. The key Medtool-like
-    control is cgal_max_element_size, which acts as the target/maximum internal
+    first creating a dense surface and then filling it. 
+    cgal_max_element_size acts as the target/maximum internal
     tetrahedron size through CGAL's max_cell_circumradius parameter.
     """
     global pv
@@ -1951,7 +1949,7 @@ def make_cgal_mesh(args, spacing):
     facet_distance = _scale_cgal_length(getattr(args, "cgal_facet_distance", 0.5), spacing, units)
     facet_angle = float(getattr(args, "cgal_facet_angle", 30.0))
 
-    # pygalmesh expects voxel_size in x,y,z order. TrabMap spacing is z,y,x.
+    # pygalmesh expects voxel_size in x,y,z order. Trabmap spacing is z,y,x.
     voxel_size_xyz = (float(spacing[2]), float(spacing[1]), float(spacing[0]))
 
     print("Generating CGAL image-domain tetrahedral mesh...")
@@ -1978,7 +1976,7 @@ def make_cgal_mesh(args, spacing):
         raise RuntimeError(
             f"Unsupported pygalmesh version. Error was:\n{e}"
         )
-    # pygalmesh follows NumPy array axis order, but TrabMap volumes are z,y,x.
+    # pygalmesh follows NumPy array axis order, but Trabmap volumes are z,y,x.
     # Reorder to x,y,z so the CGAL mesh matches TetGen/VTP/STL outputs.
     meshio_mesh.points = meshio_mesh.points[:, [2, 1, 0]]
 
