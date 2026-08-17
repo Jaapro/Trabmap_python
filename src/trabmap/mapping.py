@@ -414,6 +414,106 @@ def transform_vector_to_anatomical(v_image: np.ndarray, anat_basis: np.ndarray) 
     return anat_basis.T @ v_image
 
 
+def orient_axial_vector_to_anatomical_a1(
+    v_image: np.ndarray,
+    anat_basis: Optional[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Resolve the sign ambiguity of an axial orientation vector using
+    anatomical axis 1.
+
+    Trabecular orientation is axial, so v and -v represent the same
+    physical orientation. When an anatomical reference frame is available,
+    the vector is represented such that its anatomical-axis-1 component
+    is always positive.
+
+    For example, if anatomical axis 1 is defined distal -> proximal,
+    every local trabecular vector is represented toward the proximal end.
+
+    This preserves meaningful signs for anatomical axes 2 and 3:
+        +A2 / -A2 can represent anterior / posterior inclination
+        +A3 / -A3 represents the corresponding third-axis inclination.
+
+    Parameters
+    ----------
+    v_image
+        Orientation vector in internal image coordinates (z, y, x).
+
+    anat_basis
+        3 x 3 anatomical basis matrix. Columns are anatomical
+        axes 1, 2, and 3 expressed in image z,y,x coordinates.
+
+    Returns
+    -------
+    v_image_oriented
+        Image-space vector with sign chosen relative to anatomical A1.
+
+    v_anat
+        Same vector expressed in anatomical coordinates.
+    """
+
+    v = unit_vector(
+        np.asarray(v_image, dtype=float)
+    )
+
+    if v is None or np.any(~np.isfinite(v)):
+        nan_vec = np.array(
+            [np.nan, np.nan, np.nan],
+            dtype=float
+        )
+        return nan_vec.copy(), nan_vec.copy()
+
+    # --------------------------------------------------------
+    # No anatomical frame:
+    # retain the old deterministic image-coordinate convention.
+    # --------------------------------------------------------
+
+    if anat_basis is None:
+        v = enforce_sign_convention(v)
+
+        return (
+            v,
+            np.array(
+                [np.nan, np.nan, np.nan],
+                dtype=float
+            )
+        )
+
+    # --------------------------------------------------------
+    # Transform into anatomical coordinates.
+    # --------------------------------------------------------
+
+    v_anat = transform_vector_to_anatomical(
+        v,
+        anat_basis
+    )
+
+    v_anat = unit_vector(v_anat)
+
+    if (
+        v_anat is None
+        or np.any(~np.isfinite(v_anat))
+    ):
+        nan_vec = np.array(
+            [np.nan, np.nan, np.nan],
+            dtype=float
+        )
+        return nan_vec.copy(), nan_vec.copy()
+
+    # --------------------------------------------------------
+    # Axial sign convention:
+    # force anatomical axis 1 to be positive.
+    #
+    # If A1 = distal -> proximal, this means every local
+    # trabecular orientation is represented toward proximal.
+    # --------------------------------------------------------
+
+    if v_anat[0] < 0:
+        v *= -1.0
+        v_anat *= -1.0
+
+    return v, v_anat
+
 def xyz_pixels_to_zyx_physical(point_xyz, spacing: tuple) -> np.ndarray:
     """Convert x,y,z pixel coordinates from the runner CSV to z,y,x physical coordinates."""
     point_xyz = np.asarray(point_xyz, dtype=float)
@@ -474,7 +574,7 @@ def build_custom_anatomical_frame(args, spacing: tuple):
 
     axis2 = unit_vector(np.cross(axis3, axis1))
     anat_basis = np.column_stack([axis1, axis2, axis3])
-    return anat_basis, enforce_sign_convention(axis1)
+    return anat_basis, axis1
 
 
 def build_custom_long_axis_vector(args, spacing: tuple) -> Optional[np.ndarray]:
@@ -500,6 +600,725 @@ def angle_to_axis_degrees(v_image: np.ndarray, axis_image: Optional[np.ndarray])
         return np.nan
     cosang = float(np.clip(abs(np.dot(v, a)), -1.0, 1.0))
     return float(np.degrees(np.arccos(cosang)))
+
+
+
+def axial_orientation_summary(
+    df: pd.DataFrame,
+    vector_cols: tuple[str, str, str],
+    weight_col: Optional[str] = None,
+) -> dict:
+    """
+    Calculate a whole-bone mean axial orientation from local unit vectors.
+
+    Orientations are summarized using the second-order orientation tensor:
+
+        M = sum(w_i * v_i v_i^T) / sum(w_i)
+
+    where v_i and -v_i give the same outer product. This makes the
+    calculation appropriate for axial trabecular orientations.
+
+    Parameters
+    ----------
+    df
+        Grid-level TrabMap results.
+    vector_cols
+        Three vector-component columns in INTERNAL image order (z, y, x).
+    weight_col
+        Optional weighting variable, e.g. "DA_ST" or "DA_MIL".
+        If None, all valid orientations receive equal weight.
+
+    Returns
+    -------
+    dict
+        Principal whole-bone orientation, orientation-tensor eigenvalues,
+        and concentration/coherence statistics.
+    """
+
+    required = list(vector_cols)
+    if weight_col is not None:
+        required.append(weight_col)
+
+    if not all(c in df.columns for c in required):
+        return {
+            "vector_zyx": np.array([np.nan, np.nan, np.nan]),
+            "eig": np.array([np.nan, np.nan, np.nan]),
+            "n": 0,
+            "weight_sum": np.nan,
+            "coherence": np.nan,
+        }
+
+    vectors = (
+        df[list(vector_cols)]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_numpy(dtype=float)
+    )
+
+    valid = np.all(np.isfinite(vectors), axis=1)
+
+    if weight_col is None:
+        weights = np.ones(len(df), dtype=float)
+    else:
+        weights = pd.to_numeric(
+            df[weight_col],
+            errors="coerce"
+        ).to_numpy(dtype=float)
+
+        valid &= np.isfinite(weights)
+        valid &= weights > 0
+
+    vectors = vectors[valid]
+    weights = weights[valid]
+
+    if len(vectors) == 0:
+        return {
+            "vector_zyx": np.array([np.nan, np.nan, np.nan]),
+            "eig": np.array([np.nan, np.nan, np.nan]),
+            "n": 0,
+            "weight_sum": np.nan,
+            "coherence": np.nan,
+        }
+
+    # Normalize every local vector.
+    norms = np.linalg.norm(vectors, axis=1)
+    keep = np.isfinite(norms) & (norms > 0)
+
+    vectors = vectors[keep]
+    weights = weights[keep]
+
+    if len(vectors) == 0:
+        return {
+            "vector_zyx": np.array([np.nan, np.nan, np.nan]),
+            "eig": np.array([np.nan, np.nan, np.nan]),
+            "n": 0,
+            "weight_sum": np.nan,
+            "coherence": np.nan,
+        }
+
+    vectors = vectors / np.linalg.norm(
+        vectors,
+        axis=1
+    )[:, None]
+
+    # Axial orientation tensor.
+    tensor = np.einsum(
+        "i,ij,ik->jk",
+        weights,
+        vectors,
+        vectors,
+    )
+
+    tensor /= float(np.sum(weights))
+
+    eigvals, eigvecs = np.linalg.eigh(tensor)
+
+    order = np.argsort(eigvals)
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    # Largest eigenvector = dominant whole-bone axial orientation.
+    # Do NOT impose an image-coordinate sign convention here.
+    # The v/-v ambiguity will later be resolved relative to anatomical
+    # axis 1 in vector_orientation_outputs().
+    principal = eigvecs[:, -1]
+    principal = unit_vector(principal)
+
+    # For normalized orientation tensors:
+    # isotropic distribution -> lambda_max ~= 1/3
+    # perfectly aligned      -> lambda_max = 1
+    #
+    # This rescales that range approximately to 0-1.
+    coherence = float(
+        (3.0 * eigvals[-1] - 1.0) / 2.0
+    )
+
+    return {
+        "vector_zyx": principal,
+        "eig": eigvals,
+        "n": int(len(vectors)),
+        "weight_sum": float(np.sum(weights)),
+        "coherence": coherence,
+    }
+
+
+def vector_orientation_outputs(
+    prefix: str,
+    vector_zyx: np.ndarray,
+    anat_basis: Optional[np.ndarray],
+) -> dict:
+    """
+    Convert a whole-bone axial orientation into image x/y/z and anatomical
+    coordinates and calculate undirected angles to each reference axis.
+
+    Trabecular orientation is axial: v and -v describe the same physical axis.
+
+    When an anatomical reference frame is available, the sign ambiguity is
+    resolved by requiring the component along anatomical axis 1 to be positive.
+    Therefore, if anatomical axis 1 is consistently defined distal -> proximal, 
+    with the distal landmark defined first and proximal second,
+    all specimen-level vectors are represented in the proximal direction.
+
+    Under a consistent landmarking protocol:
+        + anatomical axis 1 = direction from long-axis landmark 1 to landmark 2
+        + anatomical axis 2 = direction toward the rotation landmark
+        + anatomical axis 3 = right-handed orthogonal axis
+
+    This makes the signs of anatomical axes 2 and 3 comparable among specimens.
+    However, if left and rigt bones are used, axis 3 must be flipped to remain
+    comparable in either all left or all right specimens.
+
+    Parameters
+    ----------
+    prefix
+        Prefix used for output column names.
+
+    vector_zyx
+        Whole-bone orientation vector in internal image order (z, y, x).
+
+    anat_basis
+        3x3 anatomical basis matrix whose columns are anatomical axes 1, 2, 3,
+        expressed in image z,y,x coordinates.
+    """
+
+    out = {}
+
+    v = unit_vector(
+        np.asarray(vector_zyx, dtype=float)
+    )
+
+    # --------------------------------------------------------
+    # Invalid vector
+    # --------------------------------------------------------
+
+    if v is None or np.any(~np.isfinite(v)):
+
+        for suffix in [
+            "x", "y", "z",
+            "angle_to_image_x_deg",
+            "angle_to_image_y_deg",
+            "angle_to_image_z_deg",
+            "anat_1", "anat_2", "anat_3",
+            "angle_to_anat_1_deg",
+            "angle_to_anat_2_deg",
+            "angle_to_anat_3_deg",
+        ]:
+            out[f"{prefix}_{suffix}"] = np.nan
+
+        return out
+
+    # ========================================================
+    # If anatomical axes exist, use anatomical axis 1 to
+    # resolve the v / -v ambiguity.
+    # ========================================================
+
+    if anat_basis is not None:
+
+        # Transform image-space vector into anatomical coordinates.
+        va = anat_basis.T @ v
+        va = unit_vector(va)
+
+        if va is not None and np.all(np.isfinite(va)):
+
+            # ------------------------------------------------
+            # Anatomically meaningful axial sign convention
+            #
+            # Force anatomical axis 1 to be positive.
+            #
+            # Example:
+            #   axis 1 = distal -> proximal
+            #
+            # Then all whole-bone axes are represented in the
+            # proximal direction, allowing the signs of axes
+            # 2 and 3 to carry meaningful information.
+            # ------------------------------------------------
+
+            if va[0] < 0:
+                va *= -1.0
+                v *= -1.0
+
+            out[f"{prefix}_anat_1"] = float(va[0])
+            out[f"{prefix}_anat_2"] = float(va[1])
+            out[f"{prefix}_anat_3"] = float(va[2])
+
+            # Undirected angles remain 0-90 degrees because
+            # a trabecular axis has no intrinsic arrowhead.
+            out[f"{prefix}_angle_to_anat_1_deg"] = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip(abs(va[0]), 0.0, 1.0)
+                    )
+                )
+            )
+
+            out[f"{prefix}_angle_to_anat_2_deg"] = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip(abs(va[1]), 0.0, 1.0)
+                    )
+                )
+            )
+
+            out[f"{prefix}_angle_to_anat_3_deg"] = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip(abs(va[2]), 0.0, 1.0)
+                    )
+                )
+            )
+
+        else:
+
+            for suffix in [
+                "anat_1", "anat_2", "anat_3",
+                "angle_to_anat_1_deg",
+                "angle_to_anat_2_deg",
+                "angle_to_anat_3_deg",
+            ]:
+                out[f"{prefix}_{suffix}"] = np.nan
+
+    else:
+
+        # No anatomical frame.
+        # Keep an arbitrary but deterministic sign convention for visualization.
+        v = enforce_sign_convention(v)
+
+        for suffix in [
+            "anat_1", "anat_2", "anat_3",
+            "angle_to_anat_1_deg",
+            "angle_to_anat_2_deg",
+            "angle_to_anat_3_deg",
+        ]:
+            out[f"{prefix}_{suffix}"] = np.nan
+
+    # ========================================================
+    # Image-space representation
+    #
+    # Note: because v may have been flipped above to make
+    # anatomical axis 1 positive, the image-space components
+    # now use the SAME sign convention as the anatomical vector.
+    # ========================================================
+
+    vz, vy, vx = v
+
+    out[f"{prefix}_x"] = float(vx)
+    out[f"{prefix}_y"] = float(vy)
+    out[f"{prefix}_z"] = float(vz)
+
+    out[f"{prefix}_angle_to_image_x_deg"] = float(
+        np.degrees(
+            np.arccos(
+                np.clip(abs(vx), 0.0, 1.0)
+            )
+        )
+    )
+
+    out[f"{prefix}_angle_to_image_y_deg"] = float(
+        np.degrees(
+            np.arccos(
+                np.clip(abs(vy), 0.0, 1.0)
+            )
+        )
+    )
+
+    out[f"{prefix}_angle_to_image_z_deg"] = float(
+        np.degrees(
+            np.arccos(
+                np.clip(abs(vz), 0.0, 1.0)
+            )
+        )
+    )
+
+    return out
+
+
+
+def create_whole_bone_summary(
+    args,
+    results_df: pd.DataFrame,
+    bone: np.ndarray,
+    filled_mask: Optional[np.ndarray],
+    spacing: tuple,
+    edt: Optional[np.ndarray] = None,
+    spacing_edt: Optional[np.ndarray] = None,
+    anat_basis: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    """
+    Generate one-row whole-bone summary statistics for a TrabMap specimen.
+
+    Includes:
+    - physical volumes;
+    - global voxel-derived BV/TV;
+    - whole-bone trabecular thickness and spacing;
+    - grid-level summary statistics;
+    - unweighted whole-bone ST and MIL orientation;
+    - DA-weighted ST and MIL orientation;
+    - orientations relative to image x/y/z axes;
+    - orientations relative to anatomical axes 1/2/3.
+    """
+
+    summary = {}
+
+    summary["object"] = getattr(
+        args,
+        "object",
+        "object"
+    )
+
+    summary["voxel_size_z_mm"] = float(spacing[0])
+    summary["voxel_size_y_mm"] = float(spacing[1])
+    summary["voxel_size_x_mm"] = float(spacing[2])
+
+    voxel_volume = float(
+        spacing[0] * spacing[1] * spacing[2]
+    )
+
+    summary["voxel_volume_mm3"] = voxel_volume
+
+    # --------------------------------------------------------
+    # True voxel-derived volumes
+    # --------------------------------------------------------
+
+    bone_mask = bone > 0
+
+    if filled_mask is not None:
+        trabfill_mask = filled_mask.astype(bool)
+        bone_inside = bone_mask & trabfill_mask
+
+        n_bone = int(np.count_nonzero(bone_inside))
+        n_trabfill = int(np.count_nonzero(trabfill_mask))
+        n_marrow = int(
+            np.count_nonzero(
+                trabfill_mask & (~bone_mask)
+            )
+        )
+
+        summary["trabecular_bone_voxels"] = n_bone
+        summary["trabfill_voxels"] = n_trabfill
+        summary["marrow_voxels"] = n_marrow
+
+        summary["trabecular_bone_volume_mm3"] = (
+            n_bone * voxel_volume
+        )
+        summary["trabfill_volume_mm3"] = (
+            n_trabfill * voxel_volume
+        )
+        summary["marrow_volume_mm3"] = (
+            n_marrow * voxel_volume
+        )
+
+        summary["global_voxel_BVTV"] = (
+            n_bone / n_trabfill
+            if n_trabfill > 0
+            else np.nan
+        )
+
+    else:
+        bone_inside = bone_mask
+
+        n_bone = int(np.count_nonzero(bone_inside))
+
+        summary["trabecular_bone_voxels"] = n_bone
+        summary["trabecular_bone_volume_mm3"] = (
+            n_bone * voxel_volume
+        )
+
+        summary["trabfill_voxels"] = np.nan
+        summary["trabfill_volume_mm3"] = np.nan
+        summary["marrow_voxels"] = np.nan
+        summary["marrow_volume_mm3"] = np.nan
+        summary["global_voxel_BVTV"] = np.nan
+
+    # --------------------------------------------------------
+    # True voxel-level thickness
+    # --------------------------------------------------------
+
+    if edt is not None and np.any(bone_inside):
+        thickness_values = (
+            2.0 * edt[bone_inside]
+        )
+
+        thickness_values = thickness_values[
+            np.isfinite(thickness_values)
+        ]
+
+        if len(thickness_values) > 0:
+            summary["whole_bone_TbTh_mean_mm"] = float(
+                np.mean(thickness_values)
+            )
+            summary["whole_bone_TbTh_sd_mm"] = float(
+                np.std(thickness_values, ddof=1)
+            )
+            summary["whole_bone_TbTh_median_mm"] = float(
+                np.median(thickness_values)
+            )
+            summary["whole_bone_TbTh_max_mm"] = float(
+                np.max(thickness_values)
+            )
+
+    # --------------------------------------------------------
+    # True voxel-level spacing
+    # --------------------------------------------------------
+
+    if (
+        spacing_edt is not None
+        and filled_mask is not None
+    ):
+        marrow_mask = (
+            filled_mask.astype(bool)
+            & (~bone_mask)
+        )
+
+        if np.any(marrow_mask):
+            spacing_values = (
+                2.0 * spacing_edt[marrow_mask]
+            )
+
+            spacing_values = spacing_values[
+                np.isfinite(spacing_values)
+            ]
+
+            if len(spacing_values) > 0:
+                summary["whole_bone_TbSp_mean_mm"] = float(
+                    np.mean(spacing_values)
+                )
+                summary["whole_bone_TbSp_sd_mm"] = float(
+                    np.std(spacing_values, ddof=1)
+                )
+                summary["whole_bone_TbSp_median_mm"] = float(
+                    np.median(spacing_values)
+                )
+                summary["whole_bone_TbSp_max_mm"] = float(
+                    np.max(spacing_values)
+                )
+
+    # --------------------------------------------------------
+    # Grid-wise descriptive statistics
+    # --------------------------------------------------------
+
+    summary["n_grid_points"] = int(
+        len(results_df)
+    )
+
+    if "inside_filled_mask" in results_df.columns:
+        summary["n_grid_points_inside"] = int(
+            np.count_nonzero(
+                pd.to_numeric(
+                    results_df["inside_filled_mask"],
+                    errors="coerce"
+                ) == 1
+            )
+        )
+
+    numeric_summary_cols = [
+        "BVTV",
+        "EDTThickness_mean",
+        "EDTThickness_max",
+        "EDTSpacing_mean",
+        "EDTSpacing_max",
+        "DA_ST",
+        "DA_MIL",
+        "mean_intercept_length_mil",
+        "valid_fraction_trabfill",
+        "distance_to_trabfill_boundary_mm",
+    ]
+
+    for col in numeric_summary_cols:
+
+        if col not in results_df.columns:
+            continue
+
+        values = pd.to_numeric(
+            results_df[col],
+            errors="coerce"
+        )
+
+        values = values[
+            np.isfinite(values)
+        ]
+
+        if len(values) == 0:
+            continue
+
+        summary[f"{col}_n"] = int(len(values))
+        summary[f"{col}_mean"] = float(
+            np.mean(values)
+        )
+        summary[f"{col}_sd"] = float(
+            np.std(values, ddof=1)
+        )
+        summary[f"{col}_median"] = float(
+            np.median(values)
+        )
+        summary[f"{col}_min"] = float(
+            np.min(values)
+        )
+        summary[f"{col}_max"] = float(
+            np.max(values)
+        )
+
+    # ========================================================
+    # STRUCTURE TENSOR ORIENTATION
+    # ========================================================
+
+    st_cols = (
+        "primary_dir_st_z",
+        "primary_dir_st_y",
+        "primary_dir_st_x",
+    )
+
+    # Equal weighting.
+    st_raw = axial_orientation_summary(
+        results_df,
+        vector_cols=st_cols,
+        weight_col=None,
+    )
+
+    summary["ST_orientation_raw_n"] = st_raw["n"]
+    summary["ST_orientation_raw_coherence"] = st_raw["coherence"]
+    summary["ST_orientation_raw_eig1"] = st_raw["eig"][0]
+    summary["ST_orientation_raw_eig2"] = st_raw["eig"][1]
+    summary["ST_orientation_raw_eig3"] = st_raw["eig"][2]
+
+    summary.update(
+        vector_orientation_outputs(
+            "ST_orientation_raw",
+            st_raw["vector_zyx"],
+            anat_basis,
+        )
+    )
+
+    # DA-weighted.
+    st_weighted = axial_orientation_summary(
+        results_df,
+        vector_cols=st_cols,
+        weight_col="DA_ST",
+    )
+
+    summary["ST_orientation_DAweighted_n"] = (
+        st_weighted["n"]
+    )
+    summary["ST_orientation_DAweighted_coherence"] = (
+        st_weighted["coherence"]
+    )
+    summary["ST_orientation_DAweighted_eig1"] = (
+        st_weighted["eig"][0]
+    )
+    summary["ST_orientation_DAweighted_eig2"] = (
+        st_weighted["eig"][1]
+    )
+    summary["ST_orientation_DAweighted_eig3"] = (
+        st_weighted["eig"][2]
+    )
+
+    summary.update(
+        vector_orientation_outputs(
+            "ST_orientation_DAweighted",
+            st_weighted["vector_zyx"],
+            anat_basis,
+        )
+    )
+
+    # ========================================================
+    # MIL ORIENTATION
+    # ========================================================
+
+    mil_cols = (
+        "primary_dir_mil_z",
+        "primary_dir_mil_y",
+        "primary_dir_mil_x",
+    )
+
+    mil_raw = axial_orientation_summary(
+        results_df,
+        vector_cols=mil_cols,
+        weight_col=None,
+    )
+
+    summary["MIL_orientation_raw_n"] = mil_raw["n"]
+    summary["MIL_orientation_raw_coherence"] = mil_raw["coherence"]
+    summary["MIL_orientation_raw_eig1"] = mil_raw["eig"][0]
+    summary["MIL_orientation_raw_eig2"] = mil_raw["eig"][1]
+    summary["MIL_orientation_raw_eig3"] = mil_raw["eig"][2]
+
+    summary.update(
+        vector_orientation_outputs(
+            "MIL_orientation_raw",
+            mil_raw["vector_zyx"],
+            anat_basis,
+        )
+    )
+
+    mil_weighted = axial_orientation_summary(
+        results_df,
+        vector_cols=mil_cols,
+        weight_col="DA_MIL",
+    )
+
+    summary["MIL_orientation_DAweighted_n"] = (
+        mil_weighted["n"]
+    )
+    summary["MIL_orientation_DAweighted_coherence"] = (
+        mil_weighted["coherence"]
+    )
+    summary["MIL_orientation_DAweighted_eig1"] = (
+        mil_weighted["eig"][0]
+    )
+    summary["MIL_orientation_DAweighted_eig2"] = (
+        mil_weighted["eig"][1]
+    )
+    summary["MIL_orientation_DAweighted_eig3"] = (
+        mil_weighted["eig"][2]
+    )
+
+    summary.update(
+        vector_orientation_outputs(
+            "MIL_orientation_DAweighted",
+            mil_weighted["vector_zyx"],
+            anat_basis,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Useful display-vector components
+    #
+    # These scale the unit orientation axis by the orientation
+    # coherence. They are useful for plotting arrows where both
+    # direction and strength of alignment should be visible.
+    # --------------------------------------------------------
+
+    for base in [
+        "ST_orientation_raw",
+        "ST_orientation_DAweighted",
+        "MIL_orientation_raw",
+        "MIL_orientation_DAweighted",
+    ]:
+
+        coherence = summary.get(
+            f"{base}_coherence",
+            np.nan
+        )
+
+        for axis in ["x", "y", "z"]:
+            component = summary.get(
+                f"{base}_{axis}",
+                np.nan
+            )
+
+            summary[
+                f"{base}_display_{axis}"
+            ] = (
+                component * coherence
+                if np.isfinite(component)
+                and np.isfinite(coherence)
+                else np.nan
+            )
+
+    return pd.DataFrame([summary])
+
+
+
+
+
 
 def fibonacci_hemisphere_directions(n: int) -> np.ndarray:
     """Return approximately uniform undirected test directions on one hemisphere.
@@ -897,6 +1716,13 @@ def local_mil_fabric(
         "total_intersections": total_intersections,
         "total_line_length": total_line_length,
     }
+
+
+
+
+
+
+
 
 
 # =============================================================================
@@ -1395,13 +2221,31 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             order = np.argsort(eig_st)
             eig_st = eig_st[order]
             vecs_st = vecs_st[:, order]
-            dir_st = enforce_sign_convention(vecs_st[:, 0])
-            aniso_st = 1.0 - (eig_st[0] / eig_st[-1]) if eig_st[-1] > 0 else np.nan
+            # Eigenvector associated with the smallest ST eigenvalue
+            # represents the principal trabecular axis.
+            #
+            # Do not impose an arbitrary image-space sign here.
+            dir_st = unit_vector(vecs_st[:, 0])
 
-        dir_st_anat = np.array([np.nan, np.nan, np.nan], dtype=float)
-        if anat_basis is not None:
-            dir_st_anat = enforce_sign_convention(transform_vector_to_anatomical(dir_st, anat_basis))
+            if dir_st is None:
+                dir_st = np.array(
+                    [np.nan, np.nan, np.nan],
+                    dtype=float
+                )
 
+            aniso_st = (
+                1.0 - (eig_st[0] / eig_st[-1])
+                if eig_st[-1] > 0
+                else np.nan
+            )
+
+            # Resolve v/-v ambiguity relative to anatomical axis 1.
+            dir_st, dir_st_anat = (
+                orient_axial_vector_to_anatomical_a1(
+                    dir_st,
+                    anat_basis
+                )
+            )
         eig_mil = np.array([np.nan, np.nan, np.nan], dtype=float)
         dir_mil = np.array([np.nan, np.nan, np.nan], dtype=float)
         aniso_mil = np.nan
@@ -1433,10 +2277,14 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             mil_total_intersections = mil_result["total_intersections"]
             mil_total_line_length = mil_result["total_line_length"]
 
-        dir_mil_anat = np.array([np.nan, np.nan, np.nan], dtype=float)
-        if anat_basis is not None:
-            dir_mil_anat = enforce_sign_convention(transform_vector_to_anatomical(dir_mil, anat_basis))
-
+        # Apply anatomical sign convention regardless of whether
+        # a valid MIL result was produced.
+        dir_mil, dir_mil_anat = (
+            orient_axial_vector_to_anatomical_a1(
+                dir_mil,
+                anat_basis
+            )
+        )
         angle_custom = angle_to_axis_degrees(dir_st, custom_long_axis)
         angle_mil_custom = angle_to_axis_degrees(dir_mil, custom_long_axis)
         if custom_long_axis is None:
@@ -1501,6 +2349,53 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             if np.isfinite(min_bvtv) and np.isfinite(max_bvtv) and max_bvtv != min_bvtv
             else np.nan
         )
+
+        # --------------------------------------------------------
+    # Whole-bone summary statistics and orientation
+    # --------------------------------------------------------
+
+    whole_bone_summary = create_whole_bone_summary(
+        args=args,
+        results_df=results_df,
+        bone=bone,
+        filled_mask=filled_mask,
+        spacing=spacing,
+        edt=edt,
+        spacing_edt=spacing_edt,
+        anat_basis=anat_basis,
+    )
+
+    summary_path = out_dir / prefixed_name(
+        args,
+        "whole_bone_summary.csv"
+    )
+
+    whole_bone_summary.to_csv(
+        summary_path,
+        index=False
+    )
+
+    print(
+        "Saved whole-bone summary:",
+        summary_path
+    )
+
+    summary_excel_path = out_dir / prefixed_name(
+        args,
+        "whole_bone_summary_excel.csv"
+    )
+
+    whole_bone_summary.to_csv(
+        summary_excel_path,
+        index=False,
+        sep=";",
+        decimal=","
+    )
+
+    print(
+        "Saved Excel-friendly whole-bone summary:",
+        summary_excel_path
+    )
 
     csv_path = out_dir / prefixed_name(args, "trabecular_results.csv")
     results_df.to_csv(csv_path, index=False)
