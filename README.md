@@ -5,30 +5,28 @@ Trabmap is an open-source Python pipeline for semi-automated cortical/trabecular
 References: 
 Buie, H. R., Campbell, G. M., Klinck, R. J., MacNeil, J. A., & Boyd, S. K. (2007). Automatic segmentation of cortical and trabecular compartments based on a dual threshold technique for in vivo micro-CT bone analysis. Bone, 41(4), 505-515.
 
-Gross, T., Kivell, T. L., Skinner, M. M., Nguyen, H., & Pahr, D. H. (2014). A CT-image-based framework for the holistic analysis of cortical and trabecular bone morphology. Palaeo electronica 17.3.33A https://doi.org/10.26879/438
+Gross, T., Kivell, T. L., Skinner, M. M., Nguyen, H., & Pahr, D. H. (2014). A CT-image-based framework for the holistic analysis of cortical and trabecular bone morphology. Palaeo electronica 17.3.33A
 
 
 ## Repository layout
 
-below is a layout of the folder structures, important files, and what they are used for.
+below is a layout of the folder structures, important files, and what they do:
 ```text
 trabmap/
 ├── config/trabmap_config.yaml     # edit paths and parameters here
-├── data/trabmap_runner.csv        # example runner CSV
+├── data/trabmap_runner.csv        # runner file, add specimen name and voxel size here
 ├── scripts/run_segmentation.py    # script wrapper
 ├── scripts/run_mapping.py         # script wrapper
 └── src/trabmap/
-    ├── segmentation.py            # segmentation functions and batch logic
-    ├── mapping.py                 # sphere mapping, VTP, VTK mesh export
+    ├── segmentation.py            # segmentation functions
+    ├── mapping.py                 # sphere mapping, VTP, VTK mesh export functions
     ├── config.py                  # YAML/JSON config helpers
     ├── cli_segment.py             # command-line interface
     └── cli_map.py                 # command-line interface
 ```
 
 ## Installation
-download the folder structure to your local computre, open the terminal, and navigate to the folder where trabmap
-was downloaded using cd and pasting your folder location.
-then inthe terminal, run the following commands to install a trabmap environment with all the required libraries
+download the folder structure to your local computre, open the terminal, and navigate to the folder where trabmap lives using cd and pasting your folder location. Then, in the terminal, run the following commands to install a trabmap environment with all the required libraries
 ```bash
 conda env create -f environment.yml
 conda activate trabmap
@@ -47,7 +45,7 @@ The default config expects one folder per object under `input/`:
 ```text
 input/
 └── OBJECT_NAME/
-    ├── OBJECT_NAME_TRABCORT/      # initial binary bone stack for segmentation
+    ├── OBJECT_NAME_TRABCORT/      # initial bone stacke
     └── segmentations/             # created by segmentation step
 ```
 
@@ -73,7 +71,7 @@ input/OBJECT_NAME/mappings/
 
 ## Basic use
 
-Edit `config/trabmap_config.yaml` first, especially:
+Edit `config/trabmap_config.yaml` first, especially the following parameters:
 
 ```yaml
 segmentation:
@@ -88,12 +86,6 @@ mapping:
 
 To begin the segmentation and mapping process, run:
 
-```bash
-trabmap-segment --config config/trabmap_config.yaml
-trabmap-map --config config/trabmap_config.yaml
-```
-
-Equivalent script-wrapper commands:
 
 ```bash
 python scripts/run_segmentation.py --config config/trabmap_config.yaml

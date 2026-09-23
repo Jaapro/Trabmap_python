@@ -36,9 +36,9 @@ def load_config(path: str | Path, section: str | None = None) -> dict[str, Any]:
 
 
 def apply_config_to_module(module: Any, config: Mapping[str, Any]) -> None:
-    """Set existing module-level constants from a config dictionary.
+    """Set existing module-level constants from the config dictionary.
 
-    Keys are matched case-insensitively, so `runner_csv` updates `RUNNER_CSV`.
+    Keys are matched case-insensitively, so `runner_csv` updates `RUNNER_CSV` for example.
     Unknown keys are ignored deliberately to keep configs portable.
     """
     name_lookup = {name.lower(): name for name in dir(module)}

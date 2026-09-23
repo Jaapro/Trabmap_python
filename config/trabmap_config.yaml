@@ -1,5 +1,7 @@
-# TrabMap configuration file
-# Edit mhese paths and variabeles, then run command line scripts
+# Trabmap configuration file
+# Edit the paths to whatever works on your device
+# parameters are set to defaults that appear to work well across a range
+# of situations. They can be tweaked manually if required.
 
 segmentation:
   runner_csv: data/trabmap_runner.csv
@@ -9,11 +11,11 @@ segmentation:
   segmented_column: segmented
   voxel_size_column: voxel_size
   # If a matching *_TRABCORT folder exists,Trabmap skips RAW thresholding 
-  # and uses that stack directly.
+  # and uses that stack directly
   input_folder_suffix: _TRABCORT
 
   # -----------------------------------------------------------------------
-  # Optional RAW-to-TRABCORT binary stack generation
+  # Optional RAW-to-TRABCORT binarization
   # -----------------------------------------------------------------------
   # When auto_segment_raw is true and no *_TRABCORT folder exists, Trabmap
   # looks for a folder ending in *_RAW, thresholds it with the chosen method,
@@ -30,8 +32,7 @@ segmentation:
 
   # Used only when raw_segmentation_method: multiotsu.
   # With 3 classes and raw_bone_class_min: 2, only the highest-intensity class
-  # is retained as bone.
-  # otsu is recommended over multiotsu
+  # is retained as bone. Otsu is recommended over multiotsu
   raw_multiotsu_classes: 3
   raw_bone_class_min: 2
 
@@ -49,7 +50,7 @@ segmentation:
   image_extensions: [.tif, .tiff, .png, .jpg, .jpeg]
 
   min_bone_object_size: 1000
-  use_median_filter: true
+  use_median_filter: false
   median_size_voxels: [1, 3, 3]
 
   crop_to_bone_bbox: true
@@ -60,8 +61,8 @@ segmentation:
   surface_hole_close_radius_mm: 0.60 # default 0.60
 
   keep_largest_internal_void_component: true
-  protected_bone_close_radius_mm: 0.08 #default is 0.05
-  marrow_close_radius_mm: 0.70 
+  protected_bone_close_radius_mm: 0.05 # radius used to close the cortex, not trabecular cavity. default is 0.05
+  marrow_close_radius_mm: 0.70 # radius of structuring element to close marrow cavity, default = 0.70
   internal_fill_mode: 3d
   keep_largest_trabfill_component: true
   remove_thin_trab_edge_lines: true
@@ -79,14 +80,14 @@ mapping:
   grid_step: 2.5
   margin: null
 
-  # can be skip_outside or zero_outside, see paper
+  # can be skip_outside or zero_outside. Skip outside is recommended
   center_inclusion_mode: skip_outside 
 
   # Boundary handling for non-BV/TV measurements.
   # BV/TV already ignores voxels outside TRABFILL in its denominator.
-  # These settings apply this approach to trabecular thickness and to the
-  # local samples used for st anisotropy. Boundary diagnostics
-  # are saved so effects of boundary conditzions can be evaluated.
+  # These settings apply this approach to operations involving EDT, such 
+  # as thickness, spacing, and DAst. Boundary diagnostics
+  # are saved so effects of boundary conditions can be evaluated by the user
   clip_non_bvtv_to_filled_mask: true
   ignore_trabfill_boundary_for_thickness: true
   save_boundary_diagnostics: true
@@ -102,7 +103,7 @@ mapping:
 
   # Gaussian sigma in millimetres.
   # The structure tensor is calculated after Gaussian smoothing of the EDT
-  # mapping. Specifying sigma in physical units ensures that
+  # map. Specifying sigma in physical units ensures that
   # anisotropy is measured over the same anatomical scale regardless of
   # scan resolution.
   #
@@ -112,6 +113,7 @@ mapping:
   # 0.10 mm  -> default
   # 0.20 mm  -> stronger smoothing for noisy or low res data
   ### note: I might make it scale with mean trabecular thickness in later implementations
+  # not sure yet if that is a good idea
   use_structure_tensor: true
   st_sigma: 0.1
 
@@ -119,9 +121,10 @@ mapping:
   # This is much slower than the structure-tensor method but is the default for the field
   # If true, Trabmap adds anisotropy_mil, primary_dir_mil_z/y/x,
   # primary_dir_mil_anat_1/2/3, and related diagnostic columns.
-  use_mil_anisotropy: true
+  use_mil_anisotropy: false
 
   # MIL mode. Use "medtool" to approximate Medtool defaults as closely as possible.
+  # however, this is not equivalent to medtool and I should remove this stupid name
   # Medtool defaults: -fabm MIL, -faba ellipsoid, -fabn det,
   # -morp step=5;power=2;validLength=0.
   mil_method: medtool        # "standard" or "medtool"
@@ -136,7 +139,7 @@ mapping:
   mil_norm_type: det
   mil_da_mode: bounded        # use bounded for 0-1 scaling, ratio for DA from 1-inf
 
-
+  # old code, leave this set to false unless you have good reason to crop your dataset
   use_crop: false
   crop_z: [0, 300]
   crop_y: [0, 300]
@@ -148,7 +151,8 @@ mapping:
   dense_map_mode: local_sphere
   progress_every: 50
 
-  # Optional smoothed/decimated surface mesh export for downstream analyses.
+  # Optional smoothed/decimated surface mesh export for downstream stuff like
+  # Phenotypic Point Cloud Analysis (see DeMars et al. 2021)
   # Meshes are generated from the segmentation stacks listed in
   # surface_mesh_suffixes, usually _FILL and _TRABFILL, and written to
   # input/OBJECT_NAME/mappings/surface_meshes/
@@ -172,7 +176,7 @@ mapping:
 
   # Tetrahedral mesh backend:
   # tetgen = surface-first PyVista/TetGen workflow (old, not recommended)
-  # cgal = default CGAL workflow via pygalmesh
+  # cgal = default CGAL workflow via pygalmesh (default option, highly recommended, may be issues on Macs)
   mesh_backend: cgal
 
   # CGAL mesh settings used when mesh_backend: cgal.
@@ -196,3 +200,37 @@ mapping:
   pyacvd_n_surf: 10000 #reduce if it causes failure to mesh
   pyacvd_subdivide: 0
   tetgen_switches: pq1.2Q
+
+
+# -------------------------------------------------------------------------
+# Low-memory mapping settings
+# -------------------------------------------------------------------------
+
+# Use disk to store temporary arrays and chunked structure-tensor calculations.
+# Recommended for computers with limited RAM.
+# this will slow down operations alot so set to false if your workstation has 
+# sufficient RAM
+low_memory_mode: false
+
+# Temporary working directory.
+# null = use a temporary folder inside the object's mapping output directory.
+# Alternatively specify a different location on a fast SSD drive if available
+# the faster the drive, the faster the computations
+low_memory_temp_root: null
+
+# Number of z-slices processed simultaneously during structure-tensor analysis.
+# 32 is a reasonable starting point.
+# smaller chunks use less memory but take longer to run.
+# Reduce to 16 or 8 if RAM requirement is still exceeded.
+low_memory_st_chunk_slices: 32
+
+# Overlap between ST chunks, expressed as multiples of Gaussian sigma.
+# Leave at 6.0 to avoid boundary effects!
+low_memory_st_halo_sigma: 6.0
+
+# Number of slices handled at once for binary-mask operations.
+low_memory_mask_chunk_slices: 32
+
+# Delete disk-backed temporary files after an object completes successfully.
+# TO DO: trabmap currently leaves temoporary files if the run fails, need to fix this
+low_memory_cleanup_temp: true

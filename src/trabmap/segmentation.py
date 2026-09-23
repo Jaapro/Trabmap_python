@@ -14,7 +14,7 @@ import SimpleITK as sitk
 # ============================================================
 
 # these are default values for the script. 
-# these values are overwritten by their equivalents in the
+# these values are overwritten by their lower case equivalents in the
 # config.yaml file
 
 RUNNER_CSV = "trabmap_runner.csv"
@@ -63,12 +63,15 @@ SURFACE_HOLE_CLOSE_RADIUS_MM = 0.70 # default is 0.70
 # Internal compartment
 # ------------------------------------------------------------
 
-# keep only the largest connected void in the internal compartment before dilation and erosion steps. prevents small holes in cortex missed by cortex protection to be included in the internal filled area
+# keep only the largest connected void in the internal compartment before dilation and erosion steps. 
+# this prevents small holes in cortex missed by cortex protection to be included in the internal filled area
 KEEP_LARGEST_INTERNAL_VOID_COMPONENT = True
 
 # close tiny cortical holes before subtracting from FILL
 # default 0.05, change to 0.10 or 0.15 if cortex isnt properly filled. 
 # set to lower value if trabecular bone structure is verz dense
+# if set too high, this will fill in trabecular bone and ruin your
+# segmentation
 PROTECTED_BONE_CLOSE_RADIUS_MM = 0.05 
 
 # Close marrow/intertrabecular spaces after subtraction.
@@ -337,7 +340,7 @@ def crop_to_mask_bbox(volume, mask, padding=10):
 
 
 # ============================================================
-# STACK I/O
+# STACK
 # ============================================================
 
 def read_stack(folder, image_extensions=(".tif", ".tiff", ".png", ".jpg", ".jpeg")):
@@ -657,6 +660,7 @@ def segment_bone(
 
     # --------------------------------------------------------
     # Step 2: protected bone small (holes closed in cortex)
+    # silly name, should change
     # --------------------------------------------------------
 
     print("  Closing small holes ...")
@@ -707,10 +711,10 @@ def segment_bone(
         internal_filled = internal_filled & filled_bone
 
     # --------------------------------------------------------
-    # Step 4: final mutually exclusive masks
+    # Step 4: generate mutually exclusive masks
     # --------------------------------------------------------
 
-    print("  Creating final mutually exclusive compartment masks...")
+    print("  Creating final masks...")
 
     trabecular = real_bone & internal_filled
 
@@ -719,7 +723,7 @@ def segment_bone(
     marrow_cavity = internal_filled & (~real_bone)
 
     if REMOVE_THIN_TRAB_EDGE_LINES:
-        print("  Removing edge artifacts...")
+        print("  Removing thin edge artifacts")
 
         trabecular_clean = sitk_binary_opening_voxels(
             trabecular,
@@ -812,7 +816,7 @@ def write_config_values_to_runner_row(df, idx):
 def main():
     print("\n=== Loading runner CSV ===")
 
-    df = pd.read_csv(RUNNER_CSV, sep=";")
+    df = pd.read_csv(RUNNER_CSV, sep=None, engine="python")
     df.columns = df.columns.str.strip()
 
     print("CSV columns found:")
@@ -849,7 +853,7 @@ def main():
                 object_name, debug_folder=debug_folder
             )
         except Exception as e:
-            print("  RAW SEGMENTATION FAILED")
+            print("  RAW segmentation failed")
             print(e)
             continue
 
@@ -924,10 +928,10 @@ def main():
         write_config_values_to_runner_row(df, idx)
 
         if check_runner_csv_writable(RUNNER_CSV):
-            df.to_csv(RUNNER_CSV, index=False, sep=";")
+            df.to_csv(RUNNER_CSV, index=False)
             print("  Updated runner CSV: segmented = yes")
         else:
-            print("  WARNING: CSV appears to be open in Excel.")
+            print("  WARNING: CSV appears to be open")
             print("  Could not update segmented column.")
 
         del results, volume
@@ -946,9 +950,8 @@ if __name__ == "__main__":
 
 def run_from_config(config):
     """Run batch segmentation after applying a config dictionary.
-    Config keys may be lower-case
-    YAML names such as `runner_csv` or the original uppercase names such as
-    `RUNNER_CSV`.
+    Config keys may be lower-case YAML names such as `runner_csv` or 
+    the original uppercase names such as `RUNNER_CSV`.
     """
     global CONFIG_VALUES
     CONFIG_VALUES = dict(config)

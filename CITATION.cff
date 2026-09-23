@@ -1,9 +1,9 @@
 cff-version: 1.2.0
-title: "TrabMap"
-message: "If you use TrabMap, please cite this software and the associated paper."
+title: "Trabmap"
+message: "If you use Trabmap, please cite this software and the associated paper."
 authors:
   - family-names: Saers
     given-names: Jaap
-version: 0.1.0
+version: 0.5.0
 license: MIT
-repository-code: "https://github.com/YOUR-USERNAME/trabmap"
+repository-code: "https://github.com/Jaapro/Trabmap_python"

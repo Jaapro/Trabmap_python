@@ -1,10 +1,16 @@
 """
-Trabmap local script: calculates BV/TV, EDT derived trabecular thickness and spacing, 
-structure tensor direction, ParaView VTP export, and optional tetrahedral VTK mesh export and surface meshes
+Trabmap mapping script
+Calculates BV/TV, EDT derived trabecular thickness and spacing, structure tensor direction, 
+ParaView VTP export, and optional tetrahedral VTK mesh export and surface meshes
 
 The script reads trabmap_runner.csv, finds rows where the finished column value
-is not equal to "yes", auto-detects the matching _TRAB and _TRABFILL folders, 
-runs Trabmap, prefixes outputs with the object name, and writes the settings/status back to the runner CSV.
+is not equal to "yes", auto-detects the matching _TRAB and _TRABFILL folders within 
+the segmented subfolder, runs Trabmap, prefixes outputs with the object name, 
+and writes the settings/status back to the runner CSV.
+
+This version of the script includes a low-memory option for devices with limited RAM.
+This essentially involves saving intermediate steps to disk, rather than keeping 
+them in memory. This makes the script lower, but able to run on many different devices
 
 Notes:
 - Input and filled-mask can be a folder of .tif/.tiff slices, a 3D .tif/.tiff stack, or a .npy file.
@@ -19,6 +25,8 @@ import csv
 import gc
 import glob
 import os
+import shutil
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -50,6 +58,7 @@ SETTINGS = SimpleNamespace(
     # Batch runner paths
     # -------------------------------------------------------------------------
     # CSV file needs to have at least these columns: finished, object, voxel_size.
+    # these are filled in by default if pulled from the trabmap repository on Github.
     # The uploaded example uses semicolons, which this script detects automatically.
     runner_csv="trabmap_runner.csv",
 
@@ -62,9 +71,9 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # Optional anatomical landmarks
     # -------------------------------------------------------------------------
-    # no longer used, will be  removed.
+    # no longer used, will be  removed at some point, leave it set to None.
     # instead use the runner file to give two sets of x,y,z coordinates of long 
-    # axis and one set for the rotational axis
+    # axis and one set for the rotational axis. see next block of code
     landmarks_csv=None,
 
     # -------------------------------------------------------------------------
@@ -95,9 +104,10 @@ SETTINGS = SimpleNamespace(
     # Sphere/grid settings
     # -------------------------------------------------------------------------
     # Spacing is read from the voxel_size column of the runner CSV and copied to
-    # spacing_z, spacing_y, and spacing_x for each object.
-    sphere_radius=2.5, # default is 2.5
-    grid_step=2.5, # default is 2.5
+    # spacing_z, spacing_y, and spacing_x for each object. Convention across the 
+    # field is that radius and step size are both 2.5mm
+    sphere_radius=2.5, 
+    grid_step=2.5, 
     margin=None,
 
     # What to do with grid centers outside the filled mask:
@@ -112,7 +122,8 @@ SETTINGS = SimpleNamespace(
     # BV/TV already uses only TRABFILL voxels in the denominator. These settings
     # apply similar TRABFILL sphere clipping to trabecular thickness and structure-tensor
     # anisotropy so that voxels outside the internal TRABFILL compartment do
-    # not contribute to these local measurements.
+    # not contribute to these local measurements. This code was added later, which is
+    # why this is a separate bit
     clip_non_bvtv_to_filled_mask=True,
     ignore_trabfill_boundary_for_thickness=True,
     save_boundary_diagnostics=True,
@@ -124,7 +135,7 @@ SETTINGS = SimpleNamespace(
     # to the local trabecular thickness calculation. When
     # ignore_trabfill_boundary_for_spacing=True, voxels outside TRABFILL do not
     # act as biologically meaningful background, reducing boundary bias near
-    # the edge of the trabecular compartment.
+    # the edge of the internal trabecular compartment.
     calculate_trabecular_spacing=True,
     ignore_trabfill_boundary_for_spacing=True,
 
@@ -140,12 +151,13 @@ SETTINGS = SimpleNamespace(
     # Optional Mean Intercept Length (MIL) anisotropy settings
     # -------------------------------------------------------------------------
     # This is slower than the structure-tensor method but is the standard across the field
-    # It adds separate MIL columns and does not replace the existing structure-tensor outputs.
+    # It adds separate MIL columns and does not replace the structure-tensor outputs.
     use_mil_anisotropy=True,
 
     # MIL mode. "standard" is the original Trabmap implementation.
     # "medtool" uses settings and fabric fitting chosen to mimic Medtool's
-    # default MIL fabric analysis as closely as possible.
+    # default MIL fabric analysis as closely as possible. I should really name this something
+    # else because it is not equivalent to medtool
     mil_method="medtool",       # "standard" or "medtool"
 
     # Standard Trabmap MIL settings.
@@ -184,6 +196,38 @@ SETTINGS = SimpleNamespace(
     save_dense_nifti=False,
     dense_map_mode="local_sphere",  # "local_sphere" or "center_only"
     progress_every=50,
+
+    # -------------------------------------------------------------------------
+    # Low-memory mode
+    # -------------------------------------------------------------------------
+    # Designed for laptops/workstations with limited RAM. Large 3-D
+    # arrays are stored as disk-backed numpy.memmap files, and the structure
+    # tensor is calculated in overlapping chunks instead of across the full
+    # volume at once. Calculations and output coordinates are unchanged. This
+    # just takes a lot longer.
+    low_memory_mode=True,
+
+    # Temporary disk location. None = <object>/mappings/_low_memory_temp.
+    # For best performance, point this to a fast local NVMe/SSD with lots of free
+    # space. Each object can temporarily require several GB.
+    low_memory_temp_root=None,
+
+    # Number of core Z slices processed per structure-tensor chunk. Lower this
+    # if RAM is still tight (e.g. 16); increase it on machines with more RAM.
+    low_memory_st_chunk_slices=32,
+
+    # Halo around each ST chunk, expressed as a multiple of Gaussian sigma.
+    # 6 sigma + a small safety margin reproduces the full-volume calculation
+    # while preventing chunk-boundary artifacts.
+    low_memory_st_halo_sigma=6.0,
+
+    # Number of Z slices used when constructing temporary binary masks.
+    low_memory_mask_chunk_slices=32,
+
+    # Remove temporary memmap files after each successfully completed mapping.
+    # Failed runs intentionally leave the temp folder behind for diagnostics;
+    # the folder is cleared automatically when that object is rerun.
+    low_memory_cleanup_temp=True,
 
     # -------------------------------------------------------------------------
     # Optional decimated surface mesh export
@@ -268,6 +312,12 @@ def validate_settings(args):
             raise ValueError("mil_power must be >= 0.")
     if getattr(args, "surface_mesh_file_format", "vtp") not in ["vtp", "ply", "stl"]:
         raise ValueError('surface_mesh_file_format must be "vtp", "ply", or "stl".')
+    if int(getattr(args, "low_memory_st_chunk_slices", 32)) < 1:
+        raise ValueError("low_memory_st_chunk_slices must be >= 1.")
+    if int(getattr(args, "low_memory_mask_chunk_slices", 32)) < 1:
+        raise ValueError("low_memory_mask_chunk_slices must be >= 1.")
+    if float(getattr(args, "low_memory_st_halo_sigma", 6.0)) < 3.0:
+        raise ValueError("low_memory_st_halo_sigma should be >= 3.0; 6.0 is recommended.")
     red = float(getattr(args, "surface_mesh_target_reduction", 0.90))
     if not (0.0 <= red < 1.0):
         raise ValueError("surface_mesh_target_reduction must be between 0.0 and 1.0.")
@@ -353,6 +403,287 @@ def load_optional_mask(mask_path: Optional[str], expected_shape: tuple) -> Optio
     return mask.astype(bool)
 
 
+
+# =============================================================================
+# Low-memory helpers
+# =============================================================================
+
+def _close_memmap(arr) -> None:
+    """Remove a numpy.memmap without affecting normal ndarrays."""
+    if isinstance(arr, np.memmap):
+        try:
+            arr.flush()
+        except Exception:
+            pass
+        mmap_obj = getattr(arr, "_mmap", None)
+        if mmap_obj is not None:
+            try:
+                mmap_obj.close()
+            except Exception:
+                pass
+
+
+def _prepare_low_memory_temp_dir(args) -> Path:
+    """Create a clean object-specific temp directory for disk-backed arrays."""
+    root_setting = getattr(args, "low_memory_temp_root", None)
+    if root_setting in [None, "", "None"]:
+        base = Path(args.out_dir) / "_low_memory_temp"
+    else:
+        base = Path(str(root_setting))
+
+    object_name = str(getattr(args, "object", "object"))
+    temp_dir = base / f"{object_name}_tmp"
+
+    # Safe because only this object-specific subfolder is removed.
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
+
+
+def _normalize_loaded_slice(image: np.ndarray, source_name: str = "image") -> np.ndarray:
+    """Convert one image/slice to a 2-D binary uint8 mask."""
+    image = np.asarray(image)
+    if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+        image = image[..., 0]
+    if image.ndim != 2:
+        raise ValueError(f"Expected a 2-D slice for {source_name}, got shape {image.shape}")
+    return (image > 0).astype(np.uint8, copy=False)
+
+
+def load_binary_volume_low_memory(input_path: str, temp_dir: Path, label: str) -> np.memmap:
+    """
+    Load a binary 3-D volume into a disk-backed uint8 memmap.
+
+    Folder stacks are read one TIFF slice at a time, avoiding a second complete
+    in-RAM copy of the input. Single TIFF/NPY volumes are copied to the memmap in
+    Z chunks; tifffile/numpy memory mapping is used when the source format allows.
+    """
+    if input_path is None:
+        raise ValueError("Input path is None.")
+
+    input_path = str(input_path)
+    out_path = temp_dir / f"{label}_binary_uint8.dat"
+
+    if os.path.isdir(input_path):
+        files = sorted(
+            glob.glob(os.path.join(input_path, "*.tif"))
+            + glob.glob(os.path.join(input_path, "*.tiff"))
+        )
+        if not files:
+            raise ValueError(f"No tif/tiff files found in folder: {input_path}")
+
+        first = _normalize_loaded_slice(tifffile.imread(files[0]), files[0])
+        shape = (len(files), first.shape[0], first.shape[1])
+        out = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=shape)
+        out[0] = first
+
+        for i, path in enumerate(files[1:], start=1):
+            sl = _normalize_loaded_slice(tifffile.imread(path), path)
+            if sl.shape != first.shape:
+                raise ValueError(
+                    f"Inconsistent slice dimensions in {input_path}: "
+                    f"{path} has {sl.shape}, expected {first.shape}"
+                )
+            out[i] = sl
+            if i % 250 == 0:
+                out.flush()
+        out.flush()
+        return out
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".npy":
+        source = np.load(input_path, mmap_mode="r")
+    elif ext in [".tif", ".tiff"]:
+        try:
+            source = tifffile.memmap(input_path)
+        except Exception:
+            print(
+                "WARNING: TIFF could not be memory-mapped; tifffile.imread will "
+                "temporarily load the source volume into RAM. Folder-of-slices "
+                "input is preferable for very large datasets."
+            )
+            source = tifffile.imread(input_path)
+    else:
+        raise ValueError("Input must be .npy, .tif/.tiff, or a folder of tif slices.")
+
+    source = np.asarray(source)
+    if source.ndim == 4:
+        if source.shape[-1] in [1, 3, 4]:
+            source = source[..., 0]
+        else:
+            raise ValueError(f"Unsupported 4D array shape: {source.shape}")
+    if source.ndim != 3:
+        raise ValueError(f"Loaded array must be 3D after preprocessing, got shape {source.shape}")
+
+    out = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=source.shape)
+    chunk = 32
+    for z0 in range(0, source.shape[0], chunk):
+        z1 = min(source.shape[0], z0 + chunk)
+        out[z0:z1] = (np.asarray(source[z0:z1]) > 0).astype(np.uint8)
+    out.flush()
+    return out
+
+
+def load_optional_mask_low_memory(
+    mask_path: Optional[str],
+    expected_shape: tuple,
+    temp_dir: Path,
+    label: str,
+) -> Optional[np.memmap]:
+    if mask_path is None or str(mask_path).lower() in ["none", ""]:
+        return None
+    mask = load_binary_volume_low_memory(mask_path, temp_dir, label)
+    if mask.shape != expected_shape:
+        _close_memmap(mask)
+        raise ValueError(f"Mask shape {mask.shape} does not match image shape {expected_shape}")
+    return mask
+
+
+def _build_low_memory_work_mask(
+    bone: np.ndarray,
+    filled_mask: Optional[np.ndarray],
+    out_path: Path,
+    mode: str,
+    chunk_slices: int = 32,
+) -> np.memmap:
+    """Build a disk-backed Boolean mask for EDT without a full in-RAM temporary."""
+    work = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=bone.shape)
+    chunk_slices = max(1, int(chunk_slices))
+
+    for z0 in range(0, bone.shape[0], chunk_slices):
+        z1 = min(bone.shape[0], z0 + chunk_slices)
+        b = np.asarray(bone[z0:z1]) > 0
+
+        if filled_mask is None:
+            if mode == "thickness":
+                block = b
+            elif mode == "spacing":
+                block = ~b
+            else:
+                raise ValueError(f"Unknown low-memory work-mask mode: {mode}")
+        else:
+            f = np.asarray(filled_mask[z0:z1]) > 0
+            if mode == "thickness":
+                # Same expression as the original code:
+                # (bone > 0) | (~filled_mask)
+                block = b | (~f)
+            elif mode == "spacing":
+                # Same expression as the original code when the TRABFILL
+                # boundary is ignored:
+                # (filled & ~bone) | (~filled)
+                block = (f & (~b)) | (~f)
+            elif mode == "spacing_inside_only":
+                block = f & (~b)
+            else:
+                raise ValueError(f"Unknown low-memory work-mask mode: {mode}")
+
+        work[z0:z1] = block.astype(np.uint8, copy=False)
+        del b, block
+        if filled_mask is not None:
+            del f
+
+    work.flush()
+    return work
+
+
+def _distance_transform_to_memmap(
+    mask: np.ndarray,
+    sampling: tuple,
+    out_path: Path,
+) -> np.memmap:
+    """Calculate scipy EDT directly into a disk-backed float64 array."""
+    distances = np.memmap(out_path, dtype=np.float64, mode="w+", shape=mask.shape)
+    ndimage.distance_transform_edt(
+        mask,
+        sampling=sampling,
+        return_distances=True,
+        return_indices=False,
+        distances=distances,
+    )
+    distances.flush()
+    return distances
+
+
+def structure_tensor_components_3d_chunked_low_memory(
+    edt: np.ndarray,
+    bone: np.ndarray,
+    filled_mask: Optional[np.ndarray],
+    sigma: float,
+    args,
+    temp_dir: Path,
+):
+    """
+    Compute the six 3-D structure-tensor component volumes in overlapping
+    chunks and store them as float32 memmaps.
+
+    The calculation spans the full Y/X extent. A generous Z halo means the
+    central portion of each chunk is numerically equivalent to the corresponding
+    part of a full-volume structure_tensor() calculation while greatly reducing
+    RAM use.
+    """
+    shape = edt.shape
+    chunk_slices = max(1, int(getattr(args, "low_memory_st_chunk_slices", 32)))
+    halo_sigma = float(getattr(args, "low_memory_st_halo_sigma", 6.0))
+    halo = max(4, int(math.ceil(halo_sigma * float(sigma))) + 2)
+
+    names = ["Jzz", "Jzy", "Jzx", "Jyy", "Jyx", "Jxx"]
+    outputs = [
+        np.memmap(temp_dir / f"ST_{name}_float32.dat", dtype=np.float32, mode="w+", shape=shape)
+        for name in names
+    ]
+
+    n_chunks = int(math.ceil(shape[0] / chunk_slices))
+    print(
+        f"Low-memory ST: {n_chunks} Z chunks, core={chunk_slices} slices, "
+        f"halo={halo} slices"
+    )
+
+    for chunk_index, z0 in enumerate(range(0, shape[0], chunk_slices), start=1):
+        z1 = min(shape[0], z0 + chunk_slices)
+        ext0 = max(0, z0 - halo)
+        ext1 = min(shape[0], z1 + halo)
+
+        # float32 matches the dtype used by the original st_image.
+        st_image = np.array(edt[ext0:ext1], dtype=np.float32, copy=True)
+
+        if getattr(args, "clip_non_bvtv_to_filled_mask", True) and filled_mask is not None:
+            valid = (
+                (np.asarray(bone[ext0:ext1]) > 0)
+                & (np.asarray(filled_mask[ext0:ext1]) > 0)
+            )
+        else:
+            valid = np.asarray(bone[ext0:ext1]) > 0
+
+        st_image *= valid.astype(np.float32, copy=False)
+        del valid
+
+        components = structure_tensor_components_3d(st_image, sigma=sigma)
+        core0 = z0 - ext0
+        core1 = core0 + (z1 - z0)
+
+        for out_arr, comp in zip(outputs, components):
+            out_arr[z0:z1] = comp[core0:core1]
+            out_arr.flush()
+
+        del st_image, components
+        gc.collect()
+        print(f"  ST chunk {chunk_index}/{n_chunks}: z={z0}:{z1}")
+
+    return tuple(outputs)
+
+
+def _cleanup_low_memory_arrays(arrays) -> None:
+    """Close any memmaps contained in a flat iterable."""
+    for arr in arrays:
+        if arr is None:
+            continue
+        if isinstance(arr, (tuple, list)):
+            _cleanup_low_memory_arrays(arr)
+        else:
+            _close_memmap(arr)
+
+
 def fill_mask_multiaxial(binary_vol: np.ndarray) -> np.ndarray:
     """Create a filled-bone mask by filling holes slice-by-slice in all three axes."""
     binary_vol = binary_vol > 0
@@ -430,7 +761,7 @@ def orient_axial_vector_to_anatomical_a1(
     For example, if anatomical axis 1 is defined distal -> proximal,
     every local trabecular vector is represented toward the proximal end.
 
-    This preserves meaningful signs for anatomical axes 2 and 3:
+    This makes signs meaningful for anatomical axes 2 and 3:
         +A2 / -A2 can represent anterior / posterior inclination
         +A3 / -A3 represents the corresponding third-axis inclination.
 
@@ -463,10 +794,9 @@ def orient_axial_vector_to_anatomical_a1(
         )
         return nan_vec.copy(), nan_vec.copy()
 
-    # --------------------------------------------------------
+    ########
     # No anatomical frame:
     # retain the old deterministic image-coordinate convention.
-    # --------------------------------------------------------
 
     if anat_basis is None:
         v = enforce_sign_convention(v)
@@ -479,9 +809,9 @@ def orient_axial_vector_to_anatomical_a1(
             )
         )
 
-    # --------------------------------------------------------
-    # Transform into anatomical coordinates.
-    # --------------------------------------------------------
+    ####
+    # Transform into anatomical coordinates
+    # ##
 
     v_anat = transform_vector_to_anatomical(
         v,
@@ -503,11 +833,6 @@ def orient_axial_vector_to_anatomical_a1(
     # --------------------------------------------------------
     # Axial sign convention:
     # force anatomical axis 1 to be positive.
-    #
-    # If A1 = distal -> proximal, this means every local
-    # trabecular orientation is represented toward proximal.
-    # --------------------------------------------------------
-
     if v_anat[0] < 0:
         v *= -1.0
         v_anat *= -1.0
@@ -610,28 +935,23 @@ def axial_orientation_summary(
 ) -> dict:
     """
     Calculate a whole-bone mean axial orientation from local unit vectors.
-
     Orientations are summarized using the second-order orientation tensor:
 
         M = sum(w_i * v_i v_i^T) / sum(w_i)
 
     where v_i and -v_i give the same outer product. This makes the
-    calculation appropriate for axial trabecular orientations.
+    calculation appropriate for axial orientations.
 
     Parameters
     ----------
-    df
-        Grid-level TrabMap results.
-    vector_cols
-        Three vector-component columns in INTERNAL image order (z, y, x).
-    weight_col
-        Optional weighting variable, e.g. "DA_ST" or "DA_MIL".
-        If None, all valid orientations receive equal weight.
+    df: Grid-level Trabmap results.
+    vector_cols: Three vector-component columns in INTERNAL image order (z, y, x).
+    weight_col: Optional weighting variable, e.g. "DA_ST" or "DA_MIL". If None, 
+    all valid orientations receive equal weight.
 
     Returns
     -------
-    dict
-        Principal whole-bone orientation, orientation-tensor eigenvalues,
+    dict: Primary whole-bone orientation, orientation-tensor eigenvalues,
         and concentration/coherence statistics.
     """
 
@@ -679,7 +999,7 @@ def axial_orientation_summary(
             "coherence": np.nan,
         }
 
-    # Normalize every local vector.
+    # Normalize every local vector
     norms = np.linalg.norm(vectors, axis=1)
     keep = np.isfinite(norms) & (norms > 0)
 
@@ -700,7 +1020,7 @@ def axial_orientation_summary(
         axis=1
     )[:, None]
 
-    # Axial orientation tensor.
+    # Axial orientation tensor
     tensor = np.einsum(
         "i,ij,ik->jk",
         weights,
@@ -716,9 +1036,9 @@ def axial_orientation_summary(
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
 
-    # Largest eigenvector = dominant whole-bone axial orientation.
-    # Do NOT impose an image-coordinate sign convention here.
-    # The v/-v ambiguity will later be resolved relative to anatomical
+    # Largest eigenvector = dominant whole-bone axial orientation
+    # Don't impose an image-coordinate sign convention here
+    # The v/-v stuff will later be resolved relative to anatomical
     # axis 1 in vector_orientation_outputs().
     principal = eigvecs[:, -1]
     principal = unit_vector(principal)
@@ -726,8 +1046,7 @@ def axial_orientation_summary(
     # For normalized orientation tensors:
     # isotropic distribution -> lambda_max ~= 1/3
     # perfectly aligned      -> lambda_max = 1
-    #
-    # This rescales that range approximately to 0-1.
+    #  This rescales that range approximately to 0-1.
     coherence = float(
         (3.0 * eigvals[-1] - 1.0) / 2.0
     )
@@ -750,10 +1069,10 @@ def vector_orientation_outputs(
     Convert a whole-bone axial orientation into image x/y/z and anatomical
     coordinates and calculate undirected angles to each reference axis.
 
-    Trabecular orientation is axial: v and -v describe the same physical axis.
+    Trabecular orientation is axial so v and -v describe the same physical axis.
 
     When an anatomical reference frame is available, the sign ambiguity is
-    resolved by requiring the component along anatomical axis 1 to be positive.
+    avoided by requiring the component along anatomical axis 1 to be positive.
     Therefore, if anatomical axis 1 is consistently defined distal -> proximal, 
     with the distal landmark defined first and proximal second,
     all specimen-level vectors are represented in the proximal direction.
@@ -767,16 +1086,16 @@ def vector_orientation_outputs(
     However, if left and rigt bones are used, axis 3 must be flipped to remain
     comparable in either all left or all right specimens.
 
+    TO DO: add a left/right colum in runner, and give this function the optiono to
+    force results into left or right
+
     Parameters
     ----------
-    prefix
-        Prefix used for output column names.
+    prefix: Prefix used for output column names.
 
-    vector_zyx
-        Whole-bone orientation vector in internal image order (z, y, x).
+    vector_zyx: Whole-bone orientation vector in internal image order (z, y, x).
 
-    anat_basis
-        3x3 anatomical basis matrix whose columns are anatomical axes 1, 2, 3,
+    anat_basis: 3x3 anatomical basis matrix whose columns are anatomical axes 1, 2, 3,
         expressed in image z,y,x coordinates.
     """
 
@@ -786,10 +1105,8 @@ def vector_orientation_outputs(
         np.asarray(vector_zyx, dtype=float)
     )
 
-    # --------------------------------------------------------
-    # Invalid vector
-    # --------------------------------------------------------
 
+    # Invalid vector
     if v is None or np.any(~np.isfinite(v)):
 
         for suffix in [
@@ -823,13 +1140,6 @@ def vector_orientation_outputs(
             # Anatomically meaningful axial sign convention
             #
             # Force anatomical axis 1 to be positive.
-            #
-            # Example:
-            #   axis 1 = distal -> proximal
-            #
-            # Then all whole-bone axes are represented in the
-            # proximal direction, allowing the signs of axes
-            # 2 and 3 to carry meaningful information.
             # ------------------------------------------------
 
             if va[0] < 0:
@@ -878,7 +1188,7 @@ def vector_orientation_outputs(
 
     else:
 
-        # No anatomical frame.
+        # No anatomical frame:
         # Keep an arbitrary but deterministic sign convention for visualization.
         v = enforce_sign_convention(v)
 
@@ -895,7 +1205,7 @@ def vector_orientation_outputs(
     #
     # Note: because v may have been flipped above to make
     # anatomical axis 1 positive, the image-space components
-    # now use the SAME sign convention as the anatomical vector.
+    # now use the same sign convention as the anatomical vector.
     # ========================================================
 
     vz, vy, vx = v
@@ -943,7 +1253,7 @@ def create_whole_bone_summary(
     anat_basis: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
-    Generate one-row whole-bone summary statistics for a TrabMap specimen.
+    Generate one-row whole-bone summary statistics for a specimen.
 
     Includes:
     - physical volumes;
@@ -1280,10 +1590,10 @@ def create_whole_bone_summary(
 
     # --------------------------------------------------------
     # Useful display-vector components
-    #
+    
     # These scale the unit orientation axis by the orientation
     # coherence. They are useful for plotting arrows where both
-    # direction and strength of alignment should be visible.
+    # direction and strength of alignment (DA) should be visible.
     # --------------------------------------------------------
 
     for base in [
@@ -1377,12 +1687,14 @@ def mil_for_direction_in_sphere(
     sample_step: float,
     min_intersections: int = 2,
 ) -> tuple[float, int, float]:
-    """Original Trabmap MIL estimate for one direction within a spherical ROI.
+    """
+    Old code: MIL estimate for one direction within a spherical ROI.
 
     This legacy mode counts binary transitions along parallel test lines and
     returns total sampled test-line length divided by the number of transitions.
-    It is kept for backwards compatibility. For Medtool-like behavior, use
-    ``mil_for_direction_in_sphere_medtool``.
+    It is kept for backwards compatibility. For moreMedtool-like behavior, use
+    mil_for_direction_in_sphere_medtool(). Although this is a bad name, as
+    output is not equivalent to medtool, just more similar than previous method
     """
     d = unit_vector(np.asarray(direction, dtype=float))
     if d is None:
@@ -1438,7 +1750,7 @@ def mil_for_direction_in_sphere(
 
 
 def _binary_run_lengths(vals: np.ndarray, sample_step: float) -> list[float]:
-    """Return physical lengths of contiguous True/bone runs along one sampled line."""
+    """Return physical lengths of contiguous True (bone) runs along one sampled line."""
     vals = np.asarray(vals, dtype=bool)
     lengths = []
     i = 0
@@ -1475,9 +1787,10 @@ def mil_for_direction_in_sphere_medtool(
     intercepted by a parallel ray field. Chords shorter than ``valid_length`` are
     ignored. ``valid_length=0`` reproduces Medtool's default.
 
-    This is not going to be identical to Medtool because the exact
+    This is not identical to Medtool because the exact
     proprietary ray generation and ellipsoid fitting details are not available,
-    but it is closer than the previous implementation
+    but it is closer than the previous implementation. still a bad name and should
+    fix tto avoid confusion
     """
     d = unit_vector(np.asarray(direction, dtype=float))
     if d is None:
@@ -1632,9 +1945,9 @@ def local_mil_fabric(
     fabric_shape: str = "ellipsoid",
     norm_type: str = "det",
 ) -> dict[str, object]:
-    """Estimate local MIL fabric tensor and anisotropy for one spherical ROI.
+    """Estimate local MIL fabric tensor and anisotropy in a spherical ROI.
 
-    method="standard" keeps the older Trabmap transition-count approach.
+    method="standard" keeps the older trabmap transition-count approach.
     method="medtool" uses a chord-length ray-field approach with ellipsoid
     fitting and determinant normalization, matching Medtool defaults as closely
     as possible from public descriptions. Still not exactly the same as 
@@ -1927,13 +2240,41 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading bone volume...")
-    bone = load_binary_volume(args.input)
+    low_memory_mode = bool(getattr(args, "low_memory_mode", False))
+    lowmem_temp_dir = None
 
-    filled_mask = load_optional_mask(args.filled_mask, bone.shape) if args.filled_mask else None
+    print("Loading bone volume...")
+    if low_memory_mode:
+        lowmem_temp_dir = _prepare_low_memory_temp_dir(args)
+        print("Low-memory mode enabled.")
+        print("Temporary disk folder:", lowmem_temp_dir)
+        bone = load_binary_volume_low_memory(
+            args.input,
+            lowmem_temp_dir,
+            "bone",
+        )
+        filled_mask = (
+            load_optional_mask_low_memory(
+                args.filled_mask,
+                bone.shape,
+                lowmem_temp_dir,
+                "filled_mask",
+            )
+            if args.filled_mask
+            else None
+        )
+    else:
+        bone = load_binary_volume(args.input)
+        filled_mask = load_optional_mask(args.filled_mask, bone.shape) if args.filled_mask else None
+
     auto_filled_mask_created = False
     if filled_mask is None:
         print("No filled-bone mask provided. Creating filled mask from binary stack...")
+        if low_memory_mode:
+            print(
+                "WARNING: automatic multiaxial filling itself uses substantial RAM. "
+                "For very large datasets, supplying an existing TRABFILL mask is recommended."
+            )
         filled_mask = fill_mask_multiaxial(bone)
         auto_filled_mask_created = True
     else:
@@ -1968,61 +2309,146 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
     print("Custom long axis present:", custom_long_axis is not None)
 
     print("Computing trabecular thickness EDT...")
-    # For thickness, this prevent voxels outside TRABFILL from acting as
-    # biologically meaningful background. This avoids artificially reducing
-    # thickness for trabecular voxels near the TRABFILL boundary.
+    # For thickness, prevent voxels outside TRABFILL from acting as biologically
+    # meaningful background. Low-memory mode builds the same mask on disk and
+    # asks scipy to write the float64 EDT directly into a memmap.
+    if low_memory_mode:
+        mask_chunk = int(getattr(args, "low_memory_mask_chunk_slices", 32))
+        thickness_mask = _build_low_memory_work_mask(
+            bone,
+            filled_mask,
+            lowmem_temp_dir / "thickness_edt_mask_uint8.dat",
+            mode=(
+                "thickness"
+                if getattr(args, "ignore_trabfill_boundary_for_thickness", True)
+                else "thickness"
+            ),
+            chunk_slices=mask_chunk,
+        )
+        # If boundary ignoring is disabled, the original calculation is simply
+        # EDT(bone). Replace the work mask with bone in that case.
+        edt_input = (
+            thickness_mask
+            if getattr(args, "ignore_trabfill_boundary_for_thickness", True) and filled_mask is not None
+            else bone
+        )
+        edt = _distance_transform_to_memmap(
+            edt_input,
+            spacing,
+            lowmem_temp_dir / "thickness_EDT_float64.dat",
+        )
+        _close_memmap(thickness_mask)
+        try:
+            (lowmem_temp_dir / "thickness_edt_mask_uint8.dat").unlink()
+        except Exception:
+            pass
+    else:
+        if getattr(args, "ignore_trabfill_boundary_for_thickness", True) and filled_mask is not None:
+            thickness_edt_mask = (bone > 0) | (~filled_mask.astype(bool))
+            edt = ndimage.distance_transform_edt(thickness_edt_mask, sampling=spacing)
+        else:
+            edt = ndimage.distance_transform_edt(bone, sampling=spacing)
+
     if getattr(args, "ignore_trabfill_boundary_for_thickness", True) and filled_mask is not None:
-        thickness_edt_mask = (bone > 0) | (~filled_mask.astype(bool))
-        edt = ndimage.distance_transform_edt(thickness_edt_mask, sampling=spacing)
         print("Thickness EDT mode: outside TRABFILL ignored as background")
     else:
-        edt = ndimage.distance_transform_edt(bone, sampling=spacing)
         print("Thickness EDT mode: standard bone-mask EDT")
     print("EDT min/max:", float(np.min(edt)), float(np.max(edt)))
 
     spacing_edt = None
     if getattr(args, "calculate_trabecular_spacing", True):
         print("Computing trabecular spacing EDT...")
-        # Tb.Sp is estimated from the distance transform of marrow space inside
-        # TRABFILL. Optionally, outside-TRABFILL voxels are treated as valid
-        # non-background so that the compartment boundary does not artificially
-        # reduce spacing values near the boundary.
+
+        if low_memory_mode:
+            if filled_mask is not None:
+                spacing_mode = (
+                    "spacing"
+                    if getattr(args, "ignore_trabfill_boundary_for_spacing", True)
+                    else "spacing_inside_only"
+                )
+            else:
+                spacing_mode = "spacing"
+
+            spacing_mask = _build_low_memory_work_mask(
+                bone,
+                filled_mask,
+                lowmem_temp_dir / "spacing_edt_mask_uint8.dat",
+                mode=spacing_mode,
+                chunk_slices=int(getattr(args, "low_memory_mask_chunk_slices", 32)),
+            )
+            spacing_edt = _distance_transform_to_memmap(
+                spacing_mask,
+                spacing,
+                lowmem_temp_dir / "spacing_EDT_float64.dat",
+            )
+            _close_memmap(spacing_mask)
+            try:
+                (lowmem_temp_dir / "spacing_edt_mask_uint8.dat").unlink()
+            except Exception:
+                pass
+        else:
+            if filled_mask is not None:
+                marrow_inside_trabfill = filled_mask.astype(bool) & (~(bone > 0))
+                if getattr(args, "ignore_trabfill_boundary_for_spacing", True):
+                    spacing_edt_mask = marrow_inside_trabfill | (~filled_mask.astype(bool))
+                else:
+                    spacing_edt_mask = marrow_inside_trabfill
+            else:
+                spacing_edt_mask = ~(bone > 0)
+            spacing_edt = ndimage.distance_transform_edt(spacing_edt_mask, sampling=spacing)
+
         if filled_mask is not None:
-            marrow_inside_trabfill = filled_mask.astype(bool) & (~(bone > 0))
             if getattr(args, "ignore_trabfill_boundary_for_spacing", True):
-                spacing_edt_mask = marrow_inside_trabfill | (~filled_mask.astype(bool))
                 print("Spacing EDT mode: outside TRABFILL ignored as background")
             else:
-                spacing_edt_mask = marrow_inside_trabfill
                 print("Spacing EDT mode: marrow inside TRABFILL only")
         else:
-            spacing_edt_mask = ~(bone > 0)
             print("Spacing EDT mode: standard inverse bone mask")
-        spacing_edt = ndimage.distance_transform_edt(spacing_edt_mask, sampling=spacing)
         print("Spacing EDT min/max:", float(np.min(spacing_edt)), float(np.max(spacing_edt)))
 
     filled_boundary_edt = None
     if getattr(args, "save_boundary_diagnostics", True) and filled_mask is not None:
         print("Computing TRABFILL boundary-distance EDT...")
-        filled_boundary_edt = ndimage.distance_transform_edt(filled_mask.astype(bool), sampling=spacing)
+        if low_memory_mode:
+            filled_boundary_edt = _distance_transform_to_memmap(
+                filled_mask,
+                spacing,
+                lowmem_temp_dir / "TRABFILL_boundary_EDT_float64.dat",
+            )
+        else:
+            filled_boundary_edt = ndimage.distance_transform_edt(filled_mask.astype(bool), sampling=spacing)
 
     st_components = None
     if args.use_structure_tensor:
         print("Computing structure tensor...")
         if getattr(args, "clip_non_bvtv_to_filled_mask", True) and filled_mask is not None:
-            st_valid_bone = (bone > 0) & filled_mask.astype(bool)
             print("Structure tensor mode: clipped to trabecular bone inside TRABFILL")
         else:
-            st_valid_bone = bone > 0
             print("Structure tensor mode: standard bone mask")
-        st_image = edt.astype(np.float32) * st_valid_bone.astype(np.float32)
+
         sigma_vox = float(args.st_sigma) / min(spacing)
-        st_components = structure_tensor_components_3d(
-            st_image,
-            sigma=sigma_vox
-        )
-        del st_image
-        gc.collect()
+
+        if low_memory_mode:
+            st_components = structure_tensor_components_3d_chunked_low_memory(
+                edt=edt,
+                bone=bone,
+                filled_mask=filled_mask,
+                sigma=sigma_vox,
+                args=args,
+                temp_dir=lowmem_temp_dir,
+            )
+        else:
+            if getattr(args, "clip_non_bvtv_to_filled_mask", True) and filled_mask is not None:
+                st_valid_bone = (bone > 0) & filled_mask.astype(bool)
+            else:
+                st_valid_bone = bone > 0
+            st_image = edt.astype(np.float32) * st_valid_bone.astype(np.float32)
+            st_components = structure_tensor_components_3d(
+                st_image,
+                sigma=sigma_vox
+            )
+            del st_image
+            gc.collect()
 
         if getattr(args, "save_mapping_debug_images", False):
             debug_dir = Path(args.out_dir).parent / "segmentations" / f"{getattr(args, 'object', 'object')}_DEBUG"
@@ -2239,13 +2665,16 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
                 else np.nan
             )
 
-            # Resolve v/-v ambiguity relative to anatomical axis 1.
-            dir_st, dir_st_anat = (
-                orient_axial_vector_to_anatomical_a1(
-                    dir_st,
-                    anat_basis
-                )
+        # Apply anatomical/image-space sign convention regardless of whether
+        # a valid ST result was produced. This also guarantees dir_st_anat is
+        # defined for empty trabecular spheres.
+        dir_st, dir_st_anat = (
+            orient_axial_vector_to_anatomical_a1(
+                dir_st,
+                anat_basis
             )
+        )
+
         eig_mil = np.array([np.nan, np.nan, np.nan], dtype=float)
         dir_mil = np.array([np.nan, np.nan, np.nan], dtype=float)
         aniso_mil = np.nan
@@ -2438,6 +2867,22 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
                 vol = center_only_heatmap(bone.shape, kept_centers_dense, results_df_dense[var].tolist())
             save_nifti(vol, spacing, str(dense_dir / prefixed_name(args, f"{var}.nii.gz")))
         print("Saved dense NIfTI maps to:", dense_dir)
+
+    if low_memory_mode:
+        # All mapping-derived outputs have now been written. Mesh/surface export
+        # later in the runner reloads the original segmentation folders, so the
+        # mapping memmaps can safely be closed here.
+        _cleanup_low_memory_arrays([st_components, filled_boundary_edt, spacing_edt, edt, filled_mask, bone])
+        gc.collect()
+
+        if bool(getattr(args, "low_memory_cleanup_temp", True)) and lowmem_temp_dir is not None:
+            shutil.rmtree(lowmem_temp_dir, ignore_errors=True)
+            print("Removed low-memory temporary files:", lowmem_temp_dir)
+
+        # Preserve the historical return tuple length. The runner does not use
+        # bone/filled_mask after analyze_spheres; returning None prevents stale
+        # references to closed memmaps.
+        return results_df, kept_centers, None, None, spacing
 
     return results_df, kept_centers, bone, filled_mask, spacing
 
@@ -2634,7 +3079,7 @@ def _decimate_surface(surface, target_reduction: float):
 
 
 def save_surface_mesh_binary(surface, out_path: Path) -> None:
-    """Save surface mesh, using binary output when supported."""
+    """Save surface mesh, using binary output"""
     try:
         surface.save(str(out_path), binary=True)
     except TypeError:
@@ -3099,8 +3544,7 @@ def get_custom_anatomical_frame_from_row(row: pd.Series):
 
     Returns
     -------
-    tuple
-        (p1_xyz, p2_xyz, prot_xyz) when all columns are present and numeric;
+    tuple: (p1_xyz, p2_xyz, prot_xyz) when all columns are present and numeric;
         otherwise (None, None, None) when columns are absent or blank.
     """
     if not row_has_complete_custom_anatomical_frame(row):
@@ -3230,24 +3674,22 @@ def write_settings_to_runner_row(df: pd.DataFrame, row_index, args) -> None:
         df.at[row_index, col] = simple_setting_value(value)
 
 
-def save_runner(df: pd.DataFrame, runner_csv: Path, delimiter: str) -> None:
+def save_runner(df: pd.DataFrame, runner_csv: Path) -> None:
     """Save runner CSV back to disk."""
-    df.to_csv(runner_csv, index=False, sep=delimiter)
+    df.to_csv(runner_csv, index=False)
 
 
 def run_from_runner(base_settings):
     """Read trabmap_runner.csv and process every row where finished is not yes."""
     runner_csv = Path(base_settings.runner_csv)
 
-    # Stop immediately if Excel or another program has locked the runner CSV.
-    # This avoids completing analyses but then failing to write finished/status columns.
+    # Stop if Excel or another program has the runner file open as this prevents 
+    # trabmap from writing in the file.
     check_runner_csv_writable(runner_csv)
 
 
     # Outputs are saved inside each object folder:
     # INPUT_ROOT / object_name / mappings
-
-
     input_root = Path(base_settings.input_root)
 
     if not runner_csv.exists():
@@ -3277,7 +3719,7 @@ def run_from_runner(base_settings):
         if object_name == "":
             runner.at[row_index, "status"] = "skipped"
             runner.at[row_index, "error_message"] = "Empty object field"
-            save_runner(runner, runner_csv, delimiter)
+            save_runner(runner, runner_csv)
             continue
 
         print("\n" + "=" * 80)
@@ -3333,7 +3775,7 @@ def run_from_runner(base_settings):
             runner.at[row_index, "error_message"] = ""
             write_settings_to_runner_row(runner, row_index, args)
             write_config_values_to_runner_row(runner, row_index, args)
-            save_runner(runner, runner_csv, delimiter)
+            save_runner(runner, runner_csv)
 
             results_df, kept_centers, bone, filled_mask, spacing = analyze_spheres(args)
 
@@ -3348,7 +3790,7 @@ def run_from_runner(base_settings):
                 runner.at[row_index, "surface_meshes_files"] = " | ".join(surface_mesh_files)
                 write_settings_to_runner_row(runner, row_index, args)
                 write_config_values_to_runner_row(runner, row_index, args)
-                save_runner(runner, runner_csv, delimiter)
+                save_runner(runner, runner_csv)
 
             if args.make_mesh:
                 make_tetra_mesh(args, spacing)
@@ -3358,13 +3800,13 @@ def run_from_runner(base_settings):
             runner.at[row_index, "error_message"] = ""
             write_settings_to_runner_row(runner, row_index, args)
             write_config_values_to_runner_row(runner, row_index, args)
-            save_runner(runner, runner_csv, delimiter)
+            save_runner(runner, runner_csv)
             print(f"Finished object: {object_name}")
 
         except Exception as e:
             runner.at[row_index, "status"] = "failed"
             runner.at[row_index, "error_message"] = str(e)
-            save_runner(runner, runner_csv, delimiter)
+            save_runner(runner, runner_csv)
             print(f"FAILED object: {object_name}")
             print(str(e))
             # Continue with the next row rather than stopping the full batch.
