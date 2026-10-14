@@ -10,14 +10,14 @@ import SimpleITK as sitk
 
 
 # ============================================================
-# USER SETTINGS
+# DEFAULT SETTINGS — edit these in the config yaml file, not here
 # ============================================================
 
 # these are default values for the script. 
 # these values are overwritten by their lower case equivalents in the
 # config.yaml file
 
-RUNNER_CSV = "trabmap_runner.csv"
+RUNNER_CSV = "data/trabmap_runner.csv"
 
 INPUT_ROOT = "input"
 
@@ -41,10 +41,10 @@ RAW_SAVE_THRESHOLD_DEBUG = True
 PERIOSTEAL_THRESHOLD = 1
 ENDOSTEAL_THRESHOLD = 1
 
-IMAGE_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
+IMAGE_EXTENSIONS = (".tif", ".tiff")
 
 MIN_BONE_OBJECT_SIZE = 1000
-USE_MEDIAN_FILTER = True
+USE_MEDIAN_FILTER = False
 MEDIAN_SIZE_VOXELS = (1, 3, 3)
 
 CROP_TO_BONE_BBOX = True
@@ -57,7 +57,7 @@ BBOX_PADDING_VOXELS = 10
 CAP_FOR_3D_FILL = True
 CAP_THICKNESS_SLICES = 5
 
-SURFACE_HOLE_CLOSE_RADIUS_MM = 0.70 # default is 0.70
+SURFACE_HOLE_CLOSE_RADIUS_MM = 0.60 # default is 0.60
 
 # ------------------------------------------------------------
 # Internal compartment
@@ -75,7 +75,7 @@ KEEP_LARGEST_INTERNAL_VOID_COMPONENT = True
 PROTECTED_BONE_CLOSE_RADIUS_MM = 0.05 
 
 # Close marrow/intertrabecular spaces after subtraction.
-MARROW_CLOSE_RADIUS_MM = 0.60
+MARROW_CLOSE_RADIUS_MM = 0.70
 
 INTERNAL_FILL_MODE = "3d"  # "3d" or "2d"
 
@@ -86,13 +86,54 @@ KEEP_LARGEST_TRABFILL_COMPONENT = True
 # this setting removes thin sheets of pixels sometimes accidentally 
 # assigned to TRAB and assigns them to cort
 REMOVE_THIN_TRAB_EDGE_LINES = True 
-THIN_TRAB_OPEN_RADIUS_VOXELS = 1
+THIN_TRAB_OPEN_RADIUS_VOXELS = 2
 
 SAVE_MIDDLE_SLICE_DEBUGS = True
+
+# Folder/output naming. These are configurable so users never need to edit
+# this script when changing the project folder layout or segmentation suffixes.
+SEGMENTATIONS_DIR_NAME = "segmentations"
+DEBUG_FOLDER_SUFFIX = "_DEBUG"
+MANUAL_FILL_FOLDER_SUFFIX = "_FILL"
+
+OUTPUT_FILL_SUFFIX = "_FILL"
+OUTPUT_CORT_SUFFIX = "_CORT"
+OUTPUT_TRAB_SUFFIX = "_TRAB"
+OUTPUT_MARROW_SUFFIX = "_MARROW"
+OUTPUT_TRABFILL_SUFFIX = "_TRABFILL"
+
+OUTPUT_IMAGE_EXTENSION = ".tif"
+OUTPUT_FOREGROUND_VALUE = 255
 
 # Raw user-supplied config values are stored here by run_from_config() so they
 # can be written back to the runner CSV for reproducibility.
 CONFIG_VALUES = {}
+
+
+def validate_settings():
+    """Catch configuration mistakes before starting a long segmentation run."""
+    if str(RAW_SEGMENTATION_METHOD).strip().lower() not in ["otsu", "multiotsu", "manual"]:
+        raise ValueError("raw_segmentation_method must be otsu, multiotsu, or manual.")
+    if str(INTERNAL_FILL_MODE).strip().lower() not in ["3d", "2d"]:
+        raise ValueError("internal_fill_mode must be 3d or 2d.")
+    if int(RAW_MULTIOTSU_CLASSES) < 2:
+        raise ValueError("raw_multiotsu_classes must be >= 2.")
+    if int(RAW_MIN_OBJECT_SIZE) < 0 or int(MIN_BONE_OBJECT_SIZE) < 0:
+        raise ValueError("Object-size thresholds must be >= 0.")
+    if int(BBOX_PADDING_VOXELS) < 0:
+        raise ValueError("bbox_padding_voxels must be >= 0.")
+    if int(CAP_THICKNESS_SLICES) < 1:
+        raise ValueError("cap_thickness_slices must be >= 1.")
+    if int(THIN_TRAB_OPEN_RADIUS_VOXELS) < 1:
+        raise ValueError("thin_trab_open_radius_voxels must be >= 1.")
+    if str(OUTPUT_IMAGE_EXTENSION).lower() not in [".tif", ".tiff"]:
+        raise ValueError("output_image_extension must be .tif or .tiff.")
+    if not 0 <= int(OUTPUT_FOREGROUND_VALUE) <= 255:
+        raise ValueError("output_foreground_value must be between 0 and 255.")
+    if not IMAGE_EXTENSIONS:
+        raise ValueError("image_extensions must contain at least one extension.")
+
+
 
 
 # ============================================================
@@ -113,7 +154,6 @@ def get_voxel_size_mm(row):
 
     if voxel_size <= 0:
         raise RuntimeError(f"Invalid voxel size: {voxel_size}")
-
     return voxel_size
 
 
@@ -134,7 +174,6 @@ def largest_component(mask):
 
     counts = np.bincount(labels.ravel())
     counts[0] = 0
-
     largest = counts.argmax()
     out = labels == largest
 
@@ -149,8 +188,6 @@ def remove_small_objects_3d(mask, min_size):
     )
 
 
-
-
 def fill_internal_voids_2d(mask):
     filled = np.zeros_like(mask, dtype=bool)
 
@@ -162,10 +199,8 @@ def fill_internal_voids_2d(mask):
 
 def fill_internal_voids(mask, mode="3d"):
     mode = mode.lower()
-
     if mode == "3d":
         return ndi.binary_fill_holes(mask)
-
     if mode == "2d":
         return fill_internal_voids_2d(mask)
 
@@ -186,7 +221,6 @@ def sitk_to_numpy_bool(img):
 
 def sitk_binary_closing(mask, radius_mm, voxel_size_mm):
     radius = radius_vector_from_mm(radius_mm, voxel_size_mm)
-
     img = numpy_bool_to_sitk(mask)
 
     closed_img = sitk.BinaryMorphologicalClosing(
@@ -198,7 +232,6 @@ def sitk_binary_closing(mask, radius_mm, voxel_size_mm):
     )
 
     closed = sitk_to_numpy_bool(closed_img)
-
     del img, closed_img
     gc.collect()
 
@@ -216,7 +249,6 @@ def sitk_binary_opening_voxels(mask, radius_voxels):
     )
 
     opened = sitk_to_numpy_bool(opened_img)
-
     del img, opened_img
     gc.collect()
 
@@ -229,7 +261,6 @@ def sitk_binary_opening_voxels(mask, radius_voxels):
 
 def cap_volume_ends(mask, cap_thickness=5):
     capped = mask.copy()
-
     nonempty = np.where(mask.reshape(mask.shape[0], -1).any(axis=1))[0]
 
     if len(nonempty) == 0:
@@ -237,7 +268,6 @@ def cap_volume_ends(mask, cap_thickness=5):
 
     first = int(nonempty[0])
     last = int(nonempty[-1])
-
     first_cap = ndi.binary_fill_holes(mask[first])
     last_cap = ndi.binary_fill_holes(mask[last])
 
@@ -294,11 +324,9 @@ def make_filled_bone(bone_mask, voxel_size_mm):
         SURFACE_HOLE_CLOSE_RADIUS_MM,
         voxel_size_mm
     )
-
     shell = largest_component(shell)
 
     print("  Filling enclosed 3D space...")
-
     filled_bone = fill_by_3d_exterior_connectivity(shell)
     filled_bone = largest_component(filled_bone)
 
@@ -343,7 +371,11 @@ def crop_to_mask_bbox(volume, mask, padding=10):
 # STACK
 # ============================================================
 
-def read_stack(folder, image_extensions=(".tif", ".tiff", ".png", ".jpg", ".jpeg")):
+def read_stack(folder, image_extensions=None):
+    # IMAGE_EXTENSIONS is a config setting. Do not duplicate a private default
+    # here, otherwise changing image_extensions in YAML has no effect.
+    if image_extensions is None:
+        image_extensions = IMAGE_EXTENSIONS
     image_extensions = tuple(image_extensions)
 
     files = sorted([
@@ -375,9 +407,9 @@ def save_stack_from_crop(mask_crop, full_shape, bbox, folder, prefix):
 
         if z0 <= z < z1:
             crop_z = z - z0
-            out[y_slice, x_slice] = mask_crop[crop_z].astype(np.uint8) * 255
+            out[y_slice, x_slice] = mask_crop[crop_z].astype(np.uint8) * int(OUTPUT_FOREGROUND_VALUE)
 
-        filename = f"{prefix}_{z:04d}.tif"
+        filename = f"{prefix}_{z:04d}{OUTPUT_IMAGE_EXTENSION}"
         tiff.imwrite(os.path.join(folder, filename), out)
 
 
@@ -387,22 +419,22 @@ def save_middle_slices(mask, debug_folder, name):
 
     os.makedirs(debug_folder, exist_ok=True)
 
-    mask_uint8 = mask.astype(np.uint8) * 255
+    mask_uint8 = mask.astype(np.uint8) * int(OUTPUT_FOREGROUND_VALUE)
 
     z_mid = mask_uint8.shape[0] // 2
     y_mid = mask_uint8.shape[1] // 2
     x_mid = mask_uint8.shape[2] // 2
 
-    tiff.imwrite(os.path.join(debug_folder, f"{name}_Zmid.tif"), mask_uint8[z_mid])
-    tiff.imwrite(os.path.join(debug_folder, f"{name}_Ymid.tif"), mask_uint8[:, y_mid, :])
-    tiff.imwrite(os.path.join(debug_folder, f"{name}_Xmid.tif"), mask_uint8[:, :, x_mid])
+    tiff.imwrite(os.path.join(debug_folder, f"{name}_Zmid{OUTPUT_IMAGE_EXTENSION}"), mask_uint8[z_mid])
+    tiff.imwrite(os.path.join(debug_folder, f"{name}_Ymid{OUTPUT_IMAGE_EXTENSION}"), mask_uint8[:, y_mid, :])
+    tiff.imwrite(os.path.join(debug_folder, f"{name}_Xmid{OUTPUT_IMAGE_EXTENSION}"), mask_uint8[:, :, x_mid])
 
 
 def save_binary_stack(mask, folder, prefix):
     os.makedirs(folder, exist_ok=True)
-    mask_u8 = mask.astype(np.uint8) * 255
+    mask_u8 = mask.astype(np.uint8) * int(OUTPUT_FOREGROUND_VALUE)
     for z in range(mask_u8.shape[0]):
-        tiff.imwrite(os.path.join(folder, f"{prefix}_{z:04d}.tif"), mask_u8[z])
+        tiff.imwrite(os.path.join(folder, f"{prefix}_{z:04d}{OUTPUT_IMAGE_EXTENSION}"), mask_u8[z])
 
 
 def save_raw_threshold_debug(raw_volume, binary_mask, debug_folder, object_name):
@@ -421,15 +453,15 @@ def save_raw_threshold_debug(raw_volume, binary_mask, debug_folder, object_name)
         return (np.clip((arr-lo)/(hi-lo), 0, 1)*255).astype(np.uint8)
 
     raw_u8 = norm8(raw_volume)
-    mask_u8 = binary_mask.astype(np.uint8) * 255
+    mask_u8 = binary_mask.astype(np.uint8) * int(OUTPUT_FOREGROUND_VALUE)
     zmid, ymid, xmid = [s // 2 for s in raw_volume.shape]
     for plane, rs, ms in [
         ("Zmid", raw_u8[zmid], mask_u8[zmid]),
         ("Ymid", raw_u8[:, ymid, :], mask_u8[:, ymid, :]),
         ("Xmid", raw_u8[:, :, xmid], mask_u8[:, :, xmid]),
     ]:
-        tiff.imwrite(os.path.join(debug_folder, f"{object_name}_RAW_{plane}.tif"), rs)
-        tiff.imwrite(os.path.join(debug_folder, f"{object_name}_RAW_segmented_{plane}.tif"), ms)
+        tiff.imwrite(os.path.join(debug_folder, f"{object_name}_RAW_{plane}{OUTPUT_IMAGE_EXTENSION}"), rs)
+        tiff.imwrite(os.path.join(debug_folder, f"{object_name}_RAW_segmented_{plane}{OUTPUT_IMAGE_EXTENSION}"), ms)
 
 
 def segment_raw_volume(raw_volume):
@@ -566,14 +598,14 @@ def find_optional_fill_folder(object_name):
 
     candidates = [
         f for f in subfolders
-        if f.endswith("_FILL")
+        if f.endswith(MANUAL_FILL_FOLDER_SUFFIX)
     ]
 
     if len(candidates) == 0:
         return None
 
     if len(candidates) > 1:
-        print("  WARNING: multiple *_FILL folders found.")
+        print(f"  WARNING: multiple *{MANUAL_FILL_FOLDER_SUFFIX} folders found.")
         print(f"  Using: {candidates[0]}")
 
     return os.path.join(object_folder, candidates[0])
@@ -603,9 +635,7 @@ def segment_bone(
             original_bone,
             padding=BBOX_PADDING_VOXELS
         )
-
         print(f"  Cropped shape: {volume.shape}")
-
         original_bone = volume >= PERIOSTEAL_THRESHOLD
 
     else:
@@ -644,7 +674,6 @@ def segment_bone(
             )
 
         filled_bone = manual_fill[bbox].astype(bool) if CROP_TO_BONE_BBOX else manual_fill.astype(bool)
-
         del manual_fill
 
     else:
@@ -715,31 +744,22 @@ def segment_bone(
     # --------------------------------------------------------
 
     print("  Creating final masks...")
-
     trabecular = real_bone & internal_filled
-
     cortical = real_bone & filled_bone & (~internal_filled)
-
     marrow_cavity = internal_filled & (~real_bone)
 
     if REMOVE_THIN_TRAB_EDGE_LINES:
         print("  Removing thin edge artifacts")
-
         trabecular_clean = sitk_binary_opening_voxels(
             trabecular,
             THIN_TRAB_OPEN_RADIUS_VOXELS
         )
 
         trabecular_clean = trabecular_clean & real_bone & internal_filled
-
         removed_from_trab = trabecular & (~trabecular_clean)
-
         trabecular = trabecular_clean
-
         cortical = cortical | removed_from_trab
-
         cortical = cortical & (~trabecular)
-
         del trabecular_clean, removed_from_trab
 
     # Safety check: remove any possible overlap
@@ -814,6 +834,7 @@ def write_config_values_to_runner_row(df, idx):
 # ============================================================
 
 def main():
+    validate_settings()
     print("\n=== Loading runner CSV ===")
 
     df = pd.read_csv(RUNNER_CSV, sep=None, engine="python")
@@ -844,9 +865,9 @@ def main():
             print(f"  {e}")
             continue
 
-        output_folder = os.path.join(INPUT_ROOT, object_name, "segmentations")
+        output_folder = os.path.join(INPUT_ROOT, object_name, SEGMENTATIONS_DIR_NAME)
         os.makedirs(output_folder, exist_ok=True)
-        debug_folder = os.path.join(output_folder, object_name + "_DEBUG")
+        debug_folder = os.path.join(output_folder, object_name + DEBUG_FOLDER_SUFFIX)
 
         try:
             input_folder, raw_status, raw_threshold = ensure_trabcort_folder(
@@ -905,11 +926,11 @@ def main():
         bbox = results["bbox"]
 
         output_name_map = {
-            "filled_bone": "_FILL",
-            "cortical": "_CORT",
-            "trabecular": "_TRAB",
-            "marrow_cavity": "_MARROW",
-            "internal_filled": "_TRABFILL"
+            "filled_bone": OUTPUT_FILL_SUFFIX,
+            "cortical": OUTPUT_CORT_SUFFIX,
+            "trabecular": OUTPUT_TRAB_SUFFIX,
+            "marrow_cavity": OUTPUT_MARROW_SUFFIX,
+            "internal_filled": OUTPUT_TRABFILL_SUFFIX,
         }
 
         for mask_name, suffix in output_name_map.items():
@@ -949,12 +970,27 @@ if __name__ == "__main__":
 # ============================================================
 
 def run_from_config(config):
-    """Run batch segmentation after applying a config dictionary.
-    Config keys may be lower-case YAML names such as `runner_csv` or 
-    the original uppercase names such as `RUNNER_CSV`.
-    """
+    """Run batch segmentation after applying a config dictionary."""
     global CONFIG_VALUES
+
+    # Fail loudly on misspelled/obsolete YAML keys instead of silently using a
+    # value embedded in this module.
+    known_keys = {
+        name.lower()
+        for name, value in globals().items()
+        if name.isupper() and name != "CONFIG_VALUES"
+    }
+    normalized_keys = {str(key).lower() for key in config}
+    unknown_keys = sorted(normalized_keys - known_keys)
+    if unknown_keys:
+        raise ValueError(
+            "Unknown segmentation config key(s): "
+            + ", ".join(unknown_keys)
+            + ". Update the YAML or add the setting explicitly to segmentation.py."
+        )
+
     CONFIG_VALUES = dict(config)
     from .config import apply_config_to_module
     apply_config_to_module(__import__(__name__, fromlist=['*']), config)
+    validate_settings()
     return main()

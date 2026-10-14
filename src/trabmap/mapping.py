@@ -27,6 +27,7 @@ import glob
 import os
 import shutil
 import math
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -57,16 +58,23 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # Batch runner paths
     # -------------------------------------------------------------------------
-    # CSV file needs to have at least these columns: finished, object, voxel_size.
+    # CSV runner file needs to have at least these columns: finished, object, voxel_size.
     # these are filled in by default if pulled from the trabmap repository on Github.
     # The uploaded example uses semicolons, which this script detects automatically.
-    runner_csv="trabmap_runner.csv",
+    runner_csv="data/trabmap_runner.csv",
 
     # Folder containing a subfolder per object.
     input_root="input",
 
-    # Output parent folder. Each object gets its own subfolder here. old code
-    output_heatmap_root=None,
+    # Runner-column and project-folder default names. Edit these in config not here
+    object_column="object",
+    finished_column="finished",
+    voxel_size_column="voxel_size",
+    segmentations_dir_name="segmentations",
+    mappings_dir_name="mappings",
+    trab_folder_suffix="_TRAB",
+    trabfill_folder_suffix="_TRABFILL",
+    debug_folder_suffix="_DEBUG",
 
     # -------------------------------------------------------------------------
     # Optional anatomical landmarks
@@ -75,6 +83,11 @@ SETTINGS = SimpleNamespace(
     # instead use the runner file to give two sets of x,y,z coordinates of long 
     # axis and one set for the rotational axis. see next block of code
     landmarks_csv=None,
+
+    # Master switch for per-specimen anatomical-frame landmarks in the runner
+    # CSV. When false, runner landmarks are ignored. When true, the frame is
+    # used only for rows with all nine landmark values present.
+    use_custom_anatomical_frame=True,
 
     # -------------------------------------------------------------------------
     # Optional custom anatomical axis settings
@@ -95,11 +108,6 @@ SETTINGS = SimpleNamespace(
     # calculated in this custom frame, and angle_to_custom_long_axis_deg is also
     # calculated. If the columns are absent or blank, no custom anatomical frame
     # is used for that object.
-    use_custom_anatomical_frame=False,
-    custom_long_axis_p1_xyz=None,
-    custom_long_axis_p2_xyz=None,
-    custom_rotation_point_xyz=None,
-
     # -------------------------------------------------------------------------
     # Sphere/grid settings
     # -------------------------------------------------------------------------
@@ -127,6 +135,7 @@ SETTINGS = SimpleNamespace(
     clip_non_bvtv_to_filled_mask=True,
     ignore_trabfill_boundary_for_thickness=True,
     save_boundary_diagnostics=True,
+    save_mapping_debug_images=False,
 
     # -------------------------------------------------------------------------
     # Trabecular spacing settings
@@ -152,7 +161,7 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     # This is slower than the structure-tensor method but is the standard across the field
     # It adds separate MIL columns and does not replace the structure-tensor outputs.
-    use_mil_anisotropy=True,
+    use_mil_anisotropy=False,
 
     # MIL mode. "standard" is the original Trabmap implementation.
     # "medtool" uses settings and fabric fitting chosen to mimic Medtool's
@@ -161,10 +170,10 @@ SETTINGS = SimpleNamespace(
     mil_method="medtool",       # "standard" or "medtool"
 
     # Standard Trabmap MIL settings.
-    mil_n_directions=91,
-    mil_line_spacing=None,       # None = one voxel width in mm, unless mil_length_units="voxels"
-    mil_sample_step=None,        # None = half a voxel width in mm, unless mil_length_units="voxels"
-    mil_min_intersections=2,
+    mil_n_directions=128,
+    mil_line_spacing=5,       # None = one voxel width in mm, unless mil_length_units="voxels"
+    mil_sample_step=5,        # None = half a voxel width in mm, unless mil_length_units="voxels"
+    mil_min_intersections=0,
     mil_da_mode="bounded",       # "bounded" = 1 - lambda_min/lambda_max; "ratio" = lambda_max/lambda_min
 
     # Settings to mimic medtools parameters as far as known. 
@@ -172,8 +181,8 @@ SETTINGS = SimpleNamespace(
     # step=5 voxels, power=2 -> 8*4^2 = 128 directions, validLength=0.
     # Medtool's -faba default is ellipsoid, -fabm default is MIL, and -fabn
     # default is determinant normalization.
-    mil_power=None,              # if set, overrides mil_n_directions using 8*4^power
-    mil_length_units="mm",       # "mm" or "voxels" for mil_line_spacing/sample_step/valid_length
+    mil_power=2,              # if set, overrides mil_n_directions using 8*4^power
+    mil_length_units="voxels",       # "mm" or "voxels" for mil_line_spacing/sample_step/valid_length
     mil_valid_length=0.0,        # minimum valid bone intercept/chord length
     mil_fabric_shape="ellipsoid",# "ellipsoid" or "tensor2"
     mil_norm_type="det",         # "det", "trace", or "none"
@@ -211,6 +220,8 @@ SETTINGS = SimpleNamespace(
     # For best performance, point this to a fast local NVMe/SSD with lots of free
     # space. Each object can temporarily require several GB.
     low_memory_temp_root=None,
+    low_memory_temp_dir_name="_low_memory_temp",
+    low_memory_object_temp_suffix="_tmp",
 
     # Number of core Z slices processed per structure-tensor chunk. Lower this
     # if RAM is still tight (e.g. 16); increase it on machines with more RAM.
@@ -224,9 +235,9 @@ SETTINGS = SimpleNamespace(
     # Number of Z slices used when constructing temporary binary masks.
     low_memory_mask_chunk_slices=32,
 
-    # Remove temporary memmap files after each successfully completed mapping.
-    # Failed runs intentionally leave the temp folder behind for diagnostics;
-    # the folder is cleared automatically when that object is rerun.
+    # Remove temporary memmap files after every object, whether mapping succeeds
+    # or fails. Set false only when deliberately retaining intermediates for
+    # debugging.
     low_memory_cleanup_temp=True,
 
     # -------------------------------------------------------------------------
@@ -259,6 +270,13 @@ SETTINGS = SimpleNamespace(
     # -------------------------------------------------------------------------
     make_mesh=True,
 
+    # Tetrahedral mesh backend and CGAL image-domain settings.
+    mesh_backend="cgal",          # "cgal" or "tetgen"
+    cgal_length_units="mm",       # "mm" or "voxels"
+    cgal_max_element_size=1.0,
+    cgal_facet_distance=0.3,
+    cgal_verbose=False,
+
     # Usually leave as None. The batch runner will save:
     # <object>_trabecular_tetra_mesh.vtk inside the object's output folder.
     mesh_out=None,
@@ -277,7 +295,7 @@ SETTINGS = SimpleNamespace(
     mesh_largest_component=True,
     meshfix=True,
     pyacvd=True,
-    pyacvd_n_surf=7500, # default was 15000, more likely to fail so set to 7500, this produces a slightly less detail surface mesh
+    pyacvd_n_surf=10000, # default was 15000, more likely to fail so set to 7500, this produces a slightly less detail surface mesh
     pyacvd_subdivide=0,
     tetgen_switches="pq1.2Q", # original value, likely results in many vertices on outside fewer inside but smaller file size
     #tetgen_switches="pq1.2a0.05Q" # .05Q constrains inside vertex size, making them more equal to the surface of the mesh, reduce to make intenral even smaller
@@ -286,7 +304,7 @@ SETTINGS = SimpleNamespace(
 
 
 def validate_settings(args):
-    """Catch common settings mistakes before long computations start"""
+    """Catch common settings mistakes before long computations start."""
     if args.center_inclusion_mode not in ["skip_outside", "zero_outside"]:
         raise ValueError('center_inclusion_mode must be "skip_outside" or "zero_outside".')
     if args.dense_map_mode not in ["local_sphere", "center_only"]:
@@ -295,32 +313,48 @@ def validate_settings(args):
         raise ValueError('mesh_target must be "cells" or "points".')
     if args.mesh_method not in ["idw", "nearest"]:
         raise ValueError('mesh_method must be "idw" or "nearest".')
-    if getattr(args, "mil_method", "standard") not in ["standard", "medtool"]:
+    if args.mesh_backend not in ["tetgen", "cgal"]:
+        raise ValueError('mesh_backend must be "tetgen" or "cgal".')
+    if args.cgal_length_units not in ["mm", "voxels"]:
+        raise ValueError('cgal_length_units must be "mm" or "voxels".')
+    if args.mil_method not in ["standard", "medtool"]:
         raise ValueError('mil_method must be "standard" or "medtool".')
-    if getattr(args, "mil_da_mode", "bounded") not in ["bounded", "ratio"]:
+    if args.mil_da_mode not in ["bounded", "ratio"]:
         raise ValueError('mil_da_mode must be "bounded" or "ratio".')
-    if getattr(args, "mil_length_units", "mm") not in ["mm", "voxels"]:
+    if args.mil_length_units not in ["mm", "voxels"]:
         raise ValueError('mil_length_units must be "mm" or "voxels".')
-    if getattr(args, "mil_fabric_shape", "ellipsoid") not in ["ellipsoid", "tensor2"]:
+    if args.mil_fabric_shape not in ["ellipsoid", "tensor2"]:
         raise ValueError('mil_fabric_shape must be "ellipsoid" or "tensor2".')
-    if getattr(args, "mil_norm_type", "det") not in ["det", "trace", "none"]:
+    if args.mil_norm_type not in ["det", "trace", "none"]:
         raise ValueError('mil_norm_type must be "det", "trace", or "none".')
-    if int(getattr(args, "mil_n_directions", 31)) < 6:
+    if int(args.mil_n_directions) < 6:
         raise ValueError("mil_n_directions must be at least 6.")
-    if getattr(args, "mil_power", None) not in [None, "", "None"]:
-        if int(getattr(args, "mil_power")) < 0:
-            raise ValueError("mil_power must be >= 0.")
-    if getattr(args, "surface_mesh_file_format", "vtp") not in ["vtp", "ply", "stl"]:
+    if args.mil_power not in [None, "", "None"] and int(args.mil_power) < 0:
+        raise ValueError("mil_power must be >= 0.")
+    if args.surface_mesh_file_format not in ["vtp", "ply", "stl"]:
         raise ValueError('surface_mesh_file_format must be "vtp", "ply", or "stl".')
-    if int(getattr(args, "low_memory_st_chunk_slices", 32)) < 1:
+    if int(args.low_memory_st_chunk_slices) < 1:
         raise ValueError("low_memory_st_chunk_slices must be >= 1.")
-    if int(getattr(args, "low_memory_mask_chunk_slices", 32)) < 1:
+    if int(args.low_memory_mask_chunk_slices) < 1:
         raise ValueError("low_memory_mask_chunk_slices must be >= 1.")
-    if float(getattr(args, "low_memory_st_halo_sigma", 6.0)) < 3.0:
+    if float(args.low_memory_st_halo_sigma) < 3.0:
         raise ValueError("low_memory_st_halo_sigma should be >= 3.0; 6.0 is recommended.")
-    red = float(getattr(args, "surface_mesh_target_reduction", 0.90))
+    red = float(args.surface_mesh_target_reduction)
     if not (0.0 <= red < 1.0):
         raise ValueError("surface_mesh_target_reduction must be between 0.0 and 1.0.")
+
+    for name in [
+        "segmentations_dir_name",
+        "mappings_dir_name",
+        "trab_folder_suffix",
+        "trabfill_folder_suffix",
+        "debug_folder_suffix",
+        "object_column",
+        "finished_column",
+        "voxel_size_column",
+    ]:
+        if str(getattr(args, name)).strip() == "":
+            raise ValueError(f"{name} must not be blank.")
 
 
 def prefixed_name(args, filename: str) -> str:
@@ -423,20 +457,62 @@ def _close_memmap(arr) -> None:
                 pass
 
 
-def _prepare_low_memory_temp_dir(args) -> Path:
-    """Create a clean object-specific temp directory for disk-backed arrays."""
+def _low_memory_temp_dir_for_args(args) -> Path:
+    """Return the object-specific low-memory temp directory without creating it."""
     root_setting = getattr(args, "low_memory_temp_root", None)
     if root_setting in [None, "", "None"]:
-        base = Path(args.out_dir) / "_low_memory_temp"
+        base = Path(args.out_dir) / str(
+            getattr(args, "low_memory_temp_dir_name", "_low_memory_temp")
+        )
     else:
         base = Path(str(root_setting))
 
     object_name = str(getattr(args, "object", "object"))
-    temp_dir = base / f"{object_name}_tmp"
+    object_suffix = str(getattr(args, "low_memory_object_temp_suffix", "_tmp"))
+    return base / f"{object_name}{object_suffix}"
 
-    # Safe because only this object-specific subfolder is removed.
+
+def _remove_low_memory_temp_dir(args, announce: bool = True) -> bool:
+    """
+    Remove an object's low-memory temp directory.
+
+    A few retries are used because Windows can briefly retain file handles after
+    numpy.memmap objects are released. Failure to clean temp files should not
+    replace the original mapping exception, so this function returns False and
+    prints a warning rather than raising.
+    """
+    temp_dir = _low_memory_temp_dir_for_args(args)
+    if not temp_dir.exists():
+        return True
+
+    last_error = None
+    for attempt in range(5):
+        gc.collect()
+        try:
+            shutil.rmtree(temp_dir)
+            if announce:
+                print("Removed low-memory temporary files:", temp_dir)
+            return True
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2 * (attempt + 1))
+
+    print(
+        "WARNING: could not completely remove low-memory temporary folder "
+        f"{temp_dir}: {last_error}"
+    )
+    return False
+
+
+def _prepare_low_memory_temp_dir(args) -> Path:
+    """Create a clean object-specific temp directory for disk-backed arrays."""
+    temp_dir = _low_memory_temp_dir_for_args(args)
+
+    # Clean up leftovers from an interrupted/failed previous run before writing
+    # new arrays for this object.
     if temp_dir.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        _remove_low_memory_temp_dir(args, announce=False)
+
     temp_dir.mkdir(parents=True, exist_ok=True)
     return temp_dir
 
@@ -451,7 +527,12 @@ def _normalize_loaded_slice(image: np.ndarray, source_name: str = "image") -> np
     return (image > 0).astype(np.uint8, copy=False)
 
 
-def load_binary_volume_low_memory(input_path: str, temp_dir: Path, label: str) -> np.memmap:
+def load_binary_volume_low_memory(
+    input_path: str,
+    temp_dir: Path,
+    label: str,
+    chunk_slices: int = 32,
+) -> np.memmap:
     """
     Load a binary 3-D volume into a disk-backed uint8 memmap.
 
@@ -517,7 +598,7 @@ def load_binary_volume_low_memory(input_path: str, temp_dir: Path, label: str) -
         raise ValueError(f"Loaded array must be 3D after preprocessing, got shape {source.shape}")
 
     out = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=source.shape)
-    chunk = 32
+    chunk = max(1, int(chunk_slices))
     for z0 in range(0, source.shape[0], chunk):
         z1 = min(source.shape[0], z0 + chunk)
         out[z0:z1] = (np.asarray(source[z0:z1]) > 0).astype(np.uint8)
@@ -530,10 +611,11 @@ def load_optional_mask_low_memory(
     expected_shape: tuple,
     temp_dir: Path,
     label: str,
+    chunk_slices: int = 32,
 ) -> Optional[np.memmap]:
     if mask_path is None or str(mask_path).lower() in ["none", ""]:
         return None
-    mask = load_binary_volume_low_memory(mask_path, temp_dir, label)
+    mask = load_binary_volume_low_memory(mask_path, temp_dir, label, chunk_slices=chunk_slices)
     if mask.shape != expected_shape:
         _close_memmap(mask)
         raise ValueError(f"Mask shape {mask.shape} does not match image shape {expected_shape}")
@@ -2252,6 +2334,7 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             args.input,
             lowmem_temp_dir,
             "bone",
+            chunk_slices=int(args.low_memory_mask_chunk_slices),
         )
         filled_mask = (
             load_optional_mask_low_memory(
@@ -2259,6 +2342,7 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
                 bone.shape,
                 lowmem_temp_dir,
                 "filled_mask",
+                chunk_slices=int(args.low_memory_mask_chunk_slices),
             )
             if args.filled_mask
             else None
@@ -2451,7 +2535,10 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
             gc.collect()
 
         if getattr(args, "save_mapping_debug_images", False):
-            debug_dir = Path(args.out_dir).parent / "segmentations" / f"{getattr(args, 'object', 'object')}_DEBUG"
+            debug_dir = (
+                Path(args.segmentations_dir)
+                / f"{getattr(args, 'object', 'object')}{args.debug_folder_suffix}"
+            )
 
             print("Saving mapping debug images to:", debug_dir)
 
@@ -2876,8 +2963,7 @@ def analyze_spheres(args) -> tuple[pd.DataFrame, list, np.ndarray, np.ndarray, t
         gc.collect()
 
         if bool(getattr(args, "low_memory_cleanup_temp", True)) and lowmem_temp_dir is not None:
-            shutil.rmtree(lowmem_temp_dir, ignore_errors=True)
-            print("Removed low-memory temporary files:", lowmem_temp_dir)
+            _remove_low_memory_temp_dir(args)
 
         # Preserve the historical return tuple length. The runner does not use
         # bone/filled_mask after analyze_spheres; returning None prevents stale
@@ -3283,11 +3369,9 @@ def make_cgal_mesh(args, spacing):
     volume = pad_binary_volume(volume.astype(np.uint8), pad_width=args.mesh_pad_width).astype(np.uint8)
     print_volume_diagnostics(volume, name="CGAL padded volume")
 
-    units = getattr(args, "cgal_length_units", "voxels")
-    max_cell = _scale_cgal_length(getattr(args, "cgal_max_element_size", 5.0), spacing, units)
-    facet_size = _scale_cgal_length(getattr(args, "cgal_facet_size", 5.0), spacing, units)
-    facet_distance = _scale_cgal_length(getattr(args, "cgal_facet_distance", 0.5), spacing, units)
-    facet_angle = float(getattr(args, "cgal_facet_angle", 30.0))
+    units = args.cgal_length_units
+    max_cell = _scale_cgal_length(args.cgal_max_element_size, spacing, units)
+    facet_distance = _scale_cgal_length(args.cgal_facet_distance, spacing, units)
 
     # pygalmesh expects voxel_size in x,y,z order. Trabmap spacing is z,y,x.
     voxel_size_xyz = (float(spacing[2]), float(spacing[1]), float(spacing[0]))
@@ -3295,9 +3379,7 @@ def make_cgal_mesh(args, spacing):
     print("Generating CGAL image-domain tetrahedral mesh...")
     print(f"  cgal_length_units: {units}")
     print(f"  max_cell_circumradius / max element size: {max_cell} mm")
-    print(f"  max_facet_size: {facet_size} mm")
     print(f"  max_facet_distance: {facet_distance} mm")
-    print(f"  min_facet_angle: {facet_angle} degrees")
 
     # pygalmesh API names have been stable for generate_from_array, but some
     # optional optimization flags vary by version. Try the complete call first,
@@ -3310,7 +3392,7 @@ def make_cgal_mesh(args, spacing):
             voxel_size=voxel_size_xyz,
             max_facet_distance=facet_distance,
             max_cell_circumradius=max_cell,
-            verbose=bool(getattr(args, "cgal_verbose", False)),
+            verbose=bool(args.cgal_verbose),
         )
     except TypeError as e:
         raise RuntimeError(
@@ -3352,7 +3434,6 @@ def make_cgal_mesh(args, spacing):
     try:
         tetmesh.field_data["mesh_backend"] = np.array(["cgal"])
         tetmesh.field_data["cgal_max_element_size_mm"] = np.array([max_cell], dtype=float)
-        tetmesh.field_data["cgal_facet_size_mm"] = np.array([facet_size], dtype=float)
         tetmesh.field_data["cgal_facet_distance_mm"] = np.array([facet_distance], dtype=float)
     except Exception:
         pass
@@ -3600,11 +3681,14 @@ def copy_settings_for_object(
     d["output_prefix"] = f"{object_name}_"
     d["segmentations_dir"] = str(trab_folder.parent)
 
-    if (
+    use_custom_frame = bool(d.get("use_custom_anatomical_frame", False))
+    have_complete_custom_frame = (
         custom_long_axis_p1_xyz is not None
         and custom_long_axis_p2_xyz is not None
         and custom_rotation_point_xyz is not None
-    ):
+    )
+
+    if use_custom_frame and have_complete_custom_frame:
         d["use_custom_anatomical_frame"] = True
         d["custom_long_axis_p1_xyz"] = custom_long_axis_p1_xyz
         d["custom_long_axis_p2_xyz"] = custom_long_axis_p2_xyz
@@ -3664,7 +3748,7 @@ def write_config_values_to_runner_row(df: pd.DataFrame, row_index, args) -> None
 
 def write_settings_to_runner_row(df: pd.DataFrame, row_index, args) -> None:
     """Add/update setting columns in the runner dataframe for the current object."""
-    exclude = {"runner_csv", "input_root", "output_heatmap_root"}
+    exclude = {"runner_csv", "input_root"}
     for key, value in vars(args).items():
         if key in exclude:
             continue
@@ -3680,16 +3764,13 @@ def save_runner(df: pd.DataFrame, runner_csv: Path) -> None:
 
 
 def run_from_runner(base_settings):
-    """Read trabmap_runner.csv and process every row where finished is not yes."""
+    """Read the runner CSV and process every row not marked as finished."""
     runner_csv = Path(base_settings.runner_csv)
 
-    # Stop if Excel or another program has the runner file open as this prevents 
-    # trabmap from writing in the file.
+    # Stop if Excel or another program has the runner file open as this prevents
+    # TrabMap from writing status/configuration information.
     check_runner_csv_writable(runner_csv)
 
-
-    # Outputs are saved inside each object folder:
-    # INPUT_ROOT / object_name / mappings
     input_root = Path(base_settings.input_root)
 
     if not runner_csv.exists():
@@ -3701,24 +3782,38 @@ def run_from_runner(base_settings):
     delimiter = detect_csv_delimiter(runner_csv)
     runner = pd.read_csv(runner_csv, sep=delimiter, dtype=str).fillna("")
 
-    required_cols = {"finished", "object", "voxel_size"}
+    object_col = str(base_settings.object_column)
+    finished_col = str(base_settings.finished_column)
+    voxel_size_col = str(base_settings.voxel_size_column)
+
+    required_cols = {finished_col, object_col, voxel_size_col}
     missing = required_cols - set(runner.columns)
     if missing:
         raise ValueError(f"Runner CSV is missing required columns: {missing}")
 
-    for col in ["status", "error_message", "input_folder", "filled_mask_folder", "output_folder", "custom_anatomical_frame_used", "custom_long_axis_used", "surface_meshes_status", "surface_meshes_files"]:
+    for col in [
+        "status",
+        "error_message",
+        "input_folder",
+        "filled_mask_folder",
+        "output_folder",
+        "custom_anatomical_frame_used",
+        "custom_long_axis_used",
+        "surface_meshes_status",
+        "surface_meshes_files",
+    ]:
         if col not in runner.columns:
             runner[col] = ""
 
-    to_run = runner[runner["finished"].str.strip().str.lower() != "yes"]
+    to_run = runner[runner[finished_col].str.strip().str.lower() != "yes"]
     print(f"Runner rows total: {len(runner)}")
     print(f"Rows still to process: {len(to_run)}")
 
     for row_index, row in to_run.iterrows():
-        object_name = str(row["object"]).strip()
+        object_name = str(row[object_col]).strip()
         if object_name == "":
             runner.at[row_index, "status"] = "skipped"
-            runner.at[row_index, "error_message"] = "Empty object field"
+            runner.at[row_index, "error_message"] = f"Empty {object_col} field"
             save_runner(runner, runner_csv)
             continue
 
@@ -3726,24 +3821,38 @@ def run_from_runner(base_settings):
         print(f"Starting object: {object_name}")
         print("=" * 80)
 
+        # Keep args available to the finally block. This lets us clean low-memory
+        # temporary files even when analyze_spheres() raises partway through.
+        args = None
+
         try:
-            voxel_size = float(str(row["voxel_size"]).strip())
+            voxel_size = float(str(row[voxel_size_col]).strip())
             object_dir = input_root / object_name
             if not object_dir.exists():
                 raise FileNotFoundError(f"Object folder not found: {object_dir}")
 
-            segmentations_dir = object_dir / "segmentations"
+            segmentations_dir = object_dir / str(base_settings.segmentations_dir_name)
 
             if not segmentations_dir.exists():
-                raise FileNotFoundError(f"Segmentations folder not found: {segmentations_dir}")
+                raise FileNotFoundError(
+                    f"Segmentations folder not found: {segmentations_dir}"
+                )
 
-            trab_folder = find_single_folder_ending(segmentations_dir, "_TRAB")
-            trabfill_folder = find_single_folder_ending(segmentations_dir, "_TRABFILL")
+            trab_folder = find_single_folder_ending(
+                segmentations_dir,
+                str(base_settings.trab_folder_suffix),
+            )
+            trabfill_folder = find_single_folder_ending(
+                segmentations_dir,
+                str(base_settings.trabfill_folder_suffix),
+            )
 
-            out_dir = object_dir / "mappings"
+            out_dir = object_dir / str(base_settings.mappings_dir_name)
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            custom_p1_xyz, custom_p2_xyz, custom_rot_xyz = get_custom_anatomical_frame_from_row(row)
+            custom_p1_xyz, custom_p2_xyz, custom_rot_xyz = (
+                get_custom_anatomical_frame_from_row(row)
+            )
 
             args = copy_settings_for_object(
                 base_settings=base_settings,
@@ -3757,20 +3866,34 @@ def run_from_runner(base_settings):
                 custom_rotation_point_xyz=custom_rot_xyz,
             )
             validate_settings(args)
+
             if args.use_custom_anatomical_frame:
                 print(
                     "Using custom anatomical frame from runner CSV: "
-                    f"long axis {args.custom_long_axis_p1_xyz} -> {args.custom_long_axis_p2_xyz}; "
+                    f"long axis {args.custom_long_axis_p1_xyz} -> "
+                    f"{args.custom_long_axis_p2_xyz}; "
                     f"rotation point {args.custom_rotation_point_xyz}"
                 )
+            elif not bool(base_settings.use_custom_anatomical_frame):
+                print(
+                    "Custom anatomical frame disabled in config; "
+                    "anatomical-frame columns will not be calculated."
+                )
             else:
-                print("No complete custom anatomical-frame landmarks for this object; anatomical-frame columns will not be calculated.")
+                print(
+                    "No complete custom anatomical-frame landmarks for this object; "
+                    "anatomical-frame columns will not be calculated."
+                )
 
             runner.at[row_index, "input_folder"] = str(trab_folder)
             runner.at[row_index, "filled_mask_folder"] = str(trabfill_folder)
             runner.at[row_index, "output_folder"] = str(out_dir)
-            runner.at[row_index, "custom_anatomical_frame_used"] = "yes" if args.use_custom_anatomical_frame else "no"
-            runner.at[row_index, "custom_long_axis_used"] = "yes" if args.use_custom_anatomical_frame else "no"
+            runner.at[row_index, "custom_anatomical_frame_used"] = (
+                "yes" if args.use_custom_anatomical_frame else "no"
+            )
+            runner.at[row_index, "custom_long_axis_used"] = (
+                "yes" if args.use_custom_anatomical_frame else "no"
+            )
             runner.at[row_index, "status"] = "running"
             runner.at[row_index, "error_message"] = ""
             write_settings_to_runner_row(runner, row_index, args)
@@ -3780,14 +3903,16 @@ def run_from_runner(base_settings):
             results_df, kept_centers, bone, filled_mask, spacing = analyze_spheres(args)
 
             surface_mesh_files = []
-            if getattr(args, "make_surface_meshes", False):
+            if args.make_surface_meshes:
                 surface_mesh_files = export_surface_meshes_for_object(
                     args=args,
                     spacing=spacing,
                     segmentations_dir=Path(args.segmentations_dir),
                 )
                 runner.at[row_index, "surface_meshes_status"] = "finished"
-                runner.at[row_index, "surface_meshes_files"] = " | ".join(surface_mesh_files)
+                runner.at[row_index, "surface_meshes_files"] = " | ".join(
+                    surface_mesh_files
+                )
                 write_settings_to_runner_row(runner, row_index, args)
                 write_config_values_to_runner_row(runner, row_index, args)
                 save_runner(runner, runner_csv)
@@ -3795,7 +3920,7 @@ def run_from_runner(base_settings):
             if args.make_mesh:
                 make_tetra_mesh(args, spacing)
 
-            runner.at[row_index, "finished"] = "yes"
+            runner.at[row_index, finished_col] = "yes"
             runner.at[row_index, "status"] = "finished"
             runner.at[row_index, "error_message"] = ""
             write_settings_to_runner_row(runner, row_index, args)
@@ -3803,14 +3928,28 @@ def run_from_runner(base_settings):
             save_runner(runner, runner_csv)
             print(f"Finished object: {object_name}")
 
-        except Exception as e:
+        except Exception as exc:
+            # Save the message before leaving the except block. Python then
+            # releases the exception traceback/frame references, which is
+            # important on Windows because those frames may still own memmaps.
+            error_message = str(exc)
             runner.at[row_index, "status"] = "failed"
-            runner.at[row_index, "error_message"] = str(e)
+            runner.at[row_index, "error_message"] = error_message
             save_runner(runner, runner_csv)
             print(f"FAILED object: {object_name}")
-            print(str(e))
-            # Continue with the next row rather than stopping the full batch.
-            continue
+            print(error_message)
+
+        finally:
+            # new edit where cleanup now happens after both successful and failed
+            # runs. This prevents multi-GB .dat files from accumulating after a
+            # failure and eating up disk space on subsequent objects.
+            if (
+                args is not None
+                and bool(getattr(args, "low_memory_mode", False))
+                and bool(getattr(args, "low_memory_cleanup_temp", True))
+            ):
+                gc.collect()
+                _remove_low_memory_temp_dir(args)
 
     print("\nBatch runner finished.")
 
@@ -3835,6 +3974,18 @@ if __name__ == "__main__":
 def run_from_config(config):
     """Run batch mapping after applying a config dictionary to SETTINGS."""
     from .config import namespace_from_defaults
+
+    # Fail loudly on misspelled/obsolete YAML keys rather than silently falling
+    # back to a value embedded in this script.
+    known_keys = set(vars(SETTINGS))
+    unknown_keys = sorted(set(config) - known_keys)
+    if unknown_keys:
+        raise ValueError(
+            "Unknown mapping config key(s): "
+            + ", ".join(unknown_keys)
+            + ". Update the YAML or add the setting explicitly to SETTINGS."
+        )
+
     args = namespace_from_defaults(SETTINGS, config)
     # Preserve the raw user-supplied YAML/JSON values so every configurable
     # input can be written back to the runner CSV for reproducibility.
